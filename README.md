@@ -1,80 +1,82 @@
 # sglang-lite
 
-**A minimal, production-grade LLM inference engine.** High cohesion "Token Factory" focused on:
+**A minimal, production-grade LLM inference engine focused on MoE models.** High-cohesion "Token Factory" focused on:
 
 - RadixAttention (prefix sharing for chat/agent workloads)
 - Continuous batching scheduler
 - Low-overhead decode with CUDA graph
 - OpenAI-compatible API (the critical control point)
 
-> "Engine 只负责「可靠地、高效地吐 token」。" — 把 agent 逻辑、structured output、多模态全部上移到 gateway / harness 层（unigateway + IntentLoop/Zene）。
+> "The engine is only responsible for reliably and efficiently producing tokens." — Push agent logic, structured output, and multimodal handling up to the gateway/harness layer (unigateway).
 
-## Mission (一句话)
+## Mission
 
-一个极简、生产可用的 LLM inference engine，只为热门 **dense** 模型提供稳定、高吞吐、低延迟的 token 生成能力。核心围绕 **continuous batching + 高效 KV cache (Radix 默认) + CUDA graph decode**，暴露极简稳定的 OpenAI 兼容接口。
+A minimal, production-grade LLM inference engine focused exclusively on popular MoE models. It provides stable, high-throughput, low-latency token generation for MoE architectures. The core revolves around continuous batching + efficient KV cache (Radix) + expert-routing-aware execution, exposing a minimal and stable OpenAI-compatible interface.
 
-**它不做**：agent runtime、multimodal、内置 constrained decoding、speculative、disagg serving、dynamic multi-LoRA。
+It does **not** do: agent runtime, multimodal, built-in constrained decoding, speculative decoding, prefill-decode disaggregation, dynamic multi-LoRA, or complex expert parallelism scheduling.
 
 ## Why sglang-lite?
 
-SGLang / vLLM 功能强大，但**偶然复杂性**过重（参考 Eric Zhang 帖）。真实生产中大量 workload（多轮 chat、RAG、工具调用）不需要全部特性，却为它们付出配置地狱、调试困难、每月变更带来的不稳定成本。
+SGLang and vLLM are powerful, but their **accidental complexity** has become overwhelming. Many real production workloads (multi-turn chat, RAG, tool calling) do not need the full feature set, yet they pay the price in configuration hell, debugging difficulty, and instability caused by monthly changes.
 
-sglang-lite 采用**高内聚**设计：
-- KV Cache 完整生命周期 + Scheduler + 执行 必须深度耦合，组成核心。
-- 其他一切（业务逻辑）上移。
+sglang-lite follows a **high-cohesion** design:
+- KV Cache full lifecycle + Scheduler + Execution must be tightly coupled as the core.
+- Everything else (business logic) is pushed upward.
 
-目标：在目标场景（prefix-heavy chat/agent）做到稳定 80%+ 理论上限 + 极低运维负担。
+The goal is to achieve stable 80%+ of theoretical throughput in target scenarios (prefix-heavy chat/agent) with extremely low operational burden.
 
-参考：nano-vLLM (~1.2k LOC 教学版)、mini-sglang。
+References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.
 
-## Target Workloads (优先级)
+**Scope note**: After re-evaluation, sglang-lite supports **only popular MoE models** (DeepSeek, Qwen-MoE, Mixtral-style, etc.). Dense models are explicitly out of scope. MoE routing and batching are first-class considerations, while keeping the overall design lightweight.
 
-1. 多轮对话 / Agent 流量（RadixAttention 优势最大，prefix sharing）
-2. RAG + Tool Use（structured 逻辑上移 gateway 用 outlines/xgrammar）
-3. 高并发 batch 推理（评测、合成数据）
+## Target Workloads (Priority)
 
-## Non-Goals (MVP 阶段坚决不做)
+1. Multi-turn dialogue / Agent traffic (RadixAttention advantage is largest due to prefix sharing)
+2. RAG + Tool Use (structured logic handled at gateway layer using outlines/xgrammar)
+3. High-concurrency batch inference (evaluation, synthetic data generation)
 
-- 多模态 (Vision/Audio/Video)
-- 内置 Structured Output / JSON mode / Grammar (上移)
+## Non-Goals (Firmly out of scope for MVP)
+
+- Multimodal (Vision/Audio/Video)
+- Built-in Structured Output / JSON mode / Grammar (pushed to gateway)
 - Speculative Decoding
 - Prefill-Decode Disaggregation
-- 动态 Multi-LoRA
-- MoE Expert Parallelism (先只 dense)
-- Diffusion / 非 Transformer
-- 内置 SGLang 式 frontend language
+- Dynamic Multi-LoRA
+- Complex MoE expert parallelism scheduling and advanced load balancing (lite provides basic MoE routing + batching support)
+- Diffusion / non-Transformer models
+- Built-in SGLang-style frontend language
 
-## Feature 取舍表（高内聚版）
+## Feature Take/Keep Table (High Cohesion)
 
-| 类别         | Feature                          | 分类          | 理由 / 策略                              | 替代 / 上移位置          |
-|--------------|----------------------------------|---------------|------------------------------------------|--------------------------|
-| API         | OpenAI /v1/chat/completions + Streaming | **重构**     | 关键控制点，完全自己掌控                 | -                        |
-| API         | /v1/models + Health              | **重构**     | 极简实现                                 | -                        |
-| KV Cache    | RadixAttention (前缀树)          | **重构**     | 核心，必须自己实现以保持内聚             | - (默认)                 |
-| KV Cache    | PagedAttention                   | **重构**     | 可插拔备选策略                           | 配置开关                 |
-| Scheduling  | Continuous Batching + 动态批     | **重构**     | 与 KV Cache 深度耦合                     | -                        |
-| Scheduling  | 队列、优先级、Timeout            | **重构**     | 生产鲁棒性                               | -                        |
-| Execution   | CUDA Graph Decode (重度)         | **重构**     | 降低 CPU overhead 的关键                 | -                        |
-| Execution   | 基础 Quant (BF16/FP8/AWQ)        | Hybrid       | Loader 复用，路径自控                    | SGLang loader 片段       |
-| Generation  | 基础 Sampling (temp/top_p/... )  | 复用/Hybrid  | 标准逻辑                                 | -                        |
-| Model       | 主流 Dense 模型加载 (Llama/Qwen/Mistral) | 直接引用 | day-0 支持成本最低                       | HF + SGLang registry 片段 |
-| Model       | Tokenizer                        | 直接引用     | transformers 成熟                        | -                        |
-| Ops         | Prometheus metrics + /healthz + graceful | **重构** | 生产必需，只暴露 lite 关心指标           | -                        |
-| Structured  | JSON mode / Grammar              | **不做**     | 破坏内聚                                 | Gateway (xgrammar)       |
-| Multimodal  | Vision 等                        | **不做**     | 内聚度极低                               | 独立服务                 |
-| Advanced    | Speculative / Disagg / Multi-LoRA| **不做** (MVP) | 复杂且非核心                             | 后期 plugin              |
+| Category    | Feature                              | Category     | Rationale / Strategy                              | Alternative / Push Up     |
+|-------------|--------------------------------------|--------------|---------------------------------------------------|---------------------------|
+| API         | OpenAI /v1/chat/completions + Streaming | **Rewrite** | Critical control point, fully owned               | -                         |
+| API         | /v1/models + Health                  | **Rewrite** | Minimal implementation                            | -                         |
+| KV Cache    | RadixAttention (prefix tree)         | **Rewrite** | Core component, must own for cohesion             | - (default)               |
+| KV Cache    | PagedAttention                       | **Rewrite** | Pluggable alternative                           | Config switch             |
+| Scheduling  | Continuous Batching + dynamic batch  | **Rewrite** | Deeply coupled with KV Cache                      | -                         |
+| Scheduling  | Queue, priority, timeout             | **Rewrite** | Production robustness                           | -                         |
+| Execution   | Heavy CUDA Graph for decode          | **Rewrite** | Key to reducing CPU overhead and high decode throughput | -                    |
+| Execution   | Basic Quant (BF16/FP8/AWQ)           | Hybrid       | Loader reusable, own the path                     | SGLang loader pieces      |
+| Generation  | Basic Sampling (temp/top_p/...)      | Reuse/Hybrid | Standard logic                                    | -                         |
+| Model       | Popular MoE model loading (DeepSeek, Qwen-MoE, Mixtral, etc.) | Direct reuse | Lowest day-0 support cost (MoE only)            | HF + registry snippets    |
+| Model       | Tokenizer                            | Direct reuse | transformers is mature                            | -                         |
+| Ops         | Prometheus metrics + /healthz + graceful | **Rewrite** | Production requirement, only expose lite-relevant metrics | -                  |
+| Structured  | JSON mode / Grammar                  | **No**       | Breaks cohesion                                   | Gateway (xgrammar)        |
+| Multimodal  | Vision etc.                          | **No**       | Very low cohesion                                 | Separate service          |
+| Advanced    | Speculative / Disagg / Multi-LoRA    | **No** (MVP) | Complex and non-core                              | Later plugin              |
 
-**分类统计**：重构/自控 ~12+，直接引用（基础设施）少量，Hybrid 过渡，不做若干。
+**Classification summary**: ~12+ full control/rewrite, small amount direct reuse (infrastructure), Hybrid transition, several out of scope.
 
-## 推荐架构（Rust + Python 混合）
+## Recommended Architecture (Rust + Python Hybrid)
 
 ```
 Client / unigateway
         ↓ (OpenAI)
-[Rust API Layer]  (axum + tokio)   <--- 控制点（必须自己写）
-  - 严格验证 + early reject
-  - 干净 internal GenerationRequest
-  - Streaming 控制 + 错误归一化
+[Rust API Layer]  (axum + tokio)   <--- Control point (must own this)
+  - Strict validation + early reject
+  - Clean internal GenerationRequest
+  - Streaming control + error normalization
   - Metrics, auth hook, rate limit hook
         ↓ (HTTP/gRPC / PyO3 / channel)
 [Python Core Engine] (Triton / FlashInfer / torch)
@@ -84,83 +86,75 @@ Client / unigateway
         ↑ token stream + usage
 ```
 
-**为什么这个组合？**
+**Why this combination?**
 
-- Rust：类型安全、低开销 streaming、完美和 unigateway 融合、完全掌控入口契约。
-- Python + Triton：当前生态里 kernel/CUDA graph/KV 实现最成熟、迭代快。参考 nano-vLLM 路径。
-- 渐进：先用 Python 核心跑通真实 workload，再考虑热点路径用 PyO3 迁移到 Rust。
+- Rust: Type safety, low-overhead streaming, seamless integration with unigateway, full control over the entry contract.
+- Python + Triton: The current ecosystem has the most mature kernel/CUDA graph/KV implementations and fastest iteration. Follows the nano-vLLM path.
+- Incremental: Use the Python core to get real workloads running first, then consider moving hot paths to Rust via PyO3.
 
-**通信（MVP）**：先用本地 HTTP（松耦合，易 debug），或 gRPC。后续 PyO3 收紧。
+**Communication (MVP)**: Start with local HTTP (loose coupling, easy to debug), or gRPC. Tighten with PyO3 later.
 
-## 技术选型
+## Tech Stack
 
-- **Rust API**：axum, tokio, serde, serde_json, tracing, reqwest (to python), uuid
-- **Python Core**：torch, transformers (for loading/tokenizer initially), triton (kernels), flashinfer (可选)
-- **接口**：极简 OpenAI 兼容 + 内部清晰 request/response
-- **部署**：单机 + 简单 TP，先不做复杂分布式
+- **Rust API**: axum, tokio, serde, serde_json, tracing, reqwest (to Python), uuid
+- **Python Core**: torch, transformers (for initial loading/tokenizer), triton (kernels), flashinfer (optional)
+- **Interface**: Minimal OpenAI-compatible + clean internal request/response
+- **Deployment**: Single-node + simple tensor parallelism. Complex distributed serving later.
 
-## MVP 路线图（Phase）
+## MVP Roadmap (Phases)
 
-**Phase 0 (验证核心，当前)**
+**Phase 0 (Core Verification)**
 
-- Rust：完整的 /v1/chat/completions (stream + 非 stream) + /v1/models + /healthz
-- 定义 GenerationRequest / Token 内部协议
-- Python 侧：stub engine（返回可预测 token），可切换到真实 HF 小模型
-- 能跑通 Llama-3.1-8B / Qwen2.5-7B 级别（或更小用于 dev）
-- 基本 continuous batching + 简单 Radix skeleton（即使不完美先跑通）
-- 度量：tokens/s、TTFT、cache hit（即使 mock）
+- Rust: Full /v1/chat/completions (stream + non-stream) + /v1/models + /healthz
+- Define internal GenerationRequest / Token protocol
+- Python side: Working MoE-aware engine with basic routing + batching (switchable to real HF MoE models)
+- Able to run popular MoE models (e.g. Mixtral, DeepSeek, Qwen-MoE class)
+- Basic continuous batching + simple Radix skeleton (even if imperfect at first)
+- Metrics: tokens/s, TTFT, cache hit (even if mocked)
 
-**Phase 1 (生产可用)**
+**Phase 1 (Production Ready)**
 
-- 真实 Radix KV Cache + Scheduler 深度集成
-- CUDA graph decode 路径
-- Prometheus metrics、结构化日志、graceful shutdown、请求超时
-- 主流模型支持（70B 级别验证 throughput）
-- 配置 preset（lite 默认）
+- Real Radix KV Cache + deep Scheduler integration
+- CUDA graph decode path
+- Prometheus metrics, structured logging, graceful shutdown, request timeouts
+- Mainstream MoE model support (validate throughput at 70B+ scale)
+- Configuration presets ("lite" defaults)
 
 **Phase 2**
 
-- Paged 备选策略
-- 有限模型扩展点
-- 可选：把 scheduler/kv 部分迁移 Rust
-- 与 unigateway 深度集成验证（KV affinity 等）
+- Optional Paged strategy
+- Limited model extension points
+- Optionally migrate scheduler/KV hotspots to Rust
+- Deep integration validation with unigateway (KV affinity, etc.)
 
-## 快速开始（当前 stub 状态）
+## Quick Start (current stub state)
 
 ```bash
 # Rust API (stub)
 cargo run -p sglang-lite-api -- serve --port 8000
 
-# 或 Python stub
+# or Python stub
 python -m sglang_lite.server
 ```
 
-然后：
+Then:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "model": "deepseek-ai/DeepSeek-V2-Lite-Chat",
     "messages": [{"role":"user","content":"Hello"}],
     "max_tokens": 128,
     "stream": true
   }'
 ```
 
-See [docs/roadmap.md](docs/roadmap.md) and [docs/architecture.md](docs/architecture.md)。
+See [docs/roadmap.md](docs/roadmap.md) and [docs/architecture.md](docs/architecture.md).
 
-## 与你的栈协同
+## Contribution and Scope Discipline
 
-- **unigateway**：L7 路由、semantic routing、KV cache affinity、auth/rate-limit
-- **IntentLoop / Zene**：agent loop、memory
-- **Engine**：只做高性能稳定的 token 工厂
-
-这样每一层内聚度都高，整体复杂度下降。
-
-## 贡献与范围纪律
-
-请严格遵守 scope。新增 feature 前先问：它是否属于「Token Factory」高内聚核心？如果是业务逻辑，请上移。
+Please strictly follow the scope. Before adding any new feature, ask: Does it belong to the high-cohesion "Token Factory" core? If it is business logic, please push it upward.
 
 ## License
 
@@ -168,6 +162,7 @@ Apache-2.0 (to be confirmed)
 
 ## Status
 
-Early stage. Phase 0 in progress. Not for production yet.
+Phase 1 in progress (Production Shell + metrics + robustness).
+See v0.1.0 for the last Phase 0 release. Not for production use yet.
 
 See git history and docs for detailed design discussions.
