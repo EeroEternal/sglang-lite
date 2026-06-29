@@ -78,14 +78,16 @@ async fn main() -> Result<()> {
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
         .route("/v1/health", get(healthz))
+        .route("/metrics", get(metrics))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("sglang-lite (Rust control plane) listening on {}", addr);
-    info!("Phase 0 stub mode — execution is simulated. Real core coming in next steps.");
+    info!("Phase 1 — Production shell + metrics");
     info!("Try: curl http://localhost:{}/v1/chat/completions -d '{{...}}'", port);
+    info!("Metrics: curl http://localhost:{}/metrics", port);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -100,34 +102,25 @@ async fn chat_completions(
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, String)> {
     // === CONTROL POINT: early validation + scope enforcement ===
     if !state.model_list.iter().any(|m| m == &req.model) {
-        // In real lite we may still allow unknown if registered later.
-        // For strict lite: reject unknown models fast.
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            format!(
-                "model '{}' not supported in sglang-lite (see GET /v1/models). Lite intentionally limits model surface.",
-                req.model
-            ),
+            json_error("invalid_request_error", &format!("model '{}' not supported in sglang-lite (see GET /v1/models).", req.model), "model_not_found"),
         ));
     }
 
-    // Reject out-of-scope features at the gate (important for cohesion)
     if req.messages.iter().any(|m| {
         matches!(m, ChatMessage::User { content: c, .. } if c.contains("data:image") || c.contains("<image>"))
-            || matches!(m, ChatMessage::System { .. } if false) // placeholder for future
     }) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            "multimodal content is not supported in sglang-lite core. Use a separate multimodal service or gateway layer.".to_string(),
+            json_error("invalid_request_error", "Multimodal content is not supported in sglang-lite core.", "multimodal_not_supported"),
         ));
     }
 
-    // We intentionally do not support response_format / json_schema here.
-    // Structured output belongs in the gateway (outlines/xgrammar).
     if req.response_format.is_some() {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            "response_format / structured output is not supported inside the engine. Please handle at gateway layer (see sglang-lite scope).".to_string(),
+            json_error("invalid_request_error", "response_format / structured output is not supported inside the engine.", "structured_output_not_supported"),
         ));
     }
 
@@ -292,7 +285,40 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "service": "sglang-lite",
-        "phase": "0",
-        "note": "stub engine — real Radix + scheduler + CUDA graph in progress"
+        "phase": "1",
+        "note": "Production shell in progress"
     }))
+}
+
+/// GET /metrics — Phase 1 observability
+async fn metrics() -> Result<String, (axum::http::StatusCode, String)> {
+    let mut output = String::from("# sglang-lite metrics (Phase 1)\n");
+
+    if let Some(base) = PYTHON_CORE_URL.as_ref() {
+        let client = reqwest::Client::new();
+        let url = format!("{}/metrics", base.trim_end_matches('/'));
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.text().await {
+                    return Ok(body);
+                }
+            }
+        }
+    }
+
+    // Fallback basic metrics
+    output.push_str("sglang_lite_phase 1\n");
+    output.push_str("sglang_lite_up 1\n");
+    Ok(output)
+}
+
+fn json_error(typ: &str, message: &str, code: &str) -> String {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": typ,
+            "param": null,
+            "code": code
+        }
+    }).to_string()
 }

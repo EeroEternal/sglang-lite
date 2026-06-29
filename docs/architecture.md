@@ -14,28 +14,26 @@ Everything else is pushed out or treated as thin adapter.
 
 ## Layered Architecture (MVP)
 
+sglang-lite is a **pure library**. Serving, routing, auth, rate limiting, advanced observability, and most configuration are peeled to unigateway or thin dedicated layers.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Clients / unigateway                  │
-│                  (OpenAI /v1/chat/completions)               │
+│  (OpenAI /v1/chat/completions + routing, auth, rate-limit)   │
+│  (advanced metrics, config, graceful shutdown peeled here)   │
 └───────────────────────────────┬─────────────────────────────┘
-                                │ HTTP
+                                │ HTTP/gRPC or in-process
 ┌───────────────────────────────▼─────────────────────────────┐
-│  Rust Control Plane (axum)  — THE CONTROL POINT              │
-│  • OpenAI request models (strict, minimal fields)            │
-│  • Validation + early reject (scope enforcement)             │
-│  • Map → clean internal GenerationRequest                    │
-│  • Streaming SSE orchestration                               │
-│  • /v1/models, /healthz, metrics export                      │
-│  • Structured logging + request id                           │
-│  • (future) auth/rate-limit hooks                            │
-│                                                              │
-│  EngineClient (HTTP/gRPC stub → Python core)                 │
+│  Rust Control Plane (axum, optional) — Control Point         │
+│  • Minimal OpenAI request models                             │
+│  • Validation + early reject                                 │
+│  • Streaming orchestration                                   │
+│  • Thin client to Python engine (or direct)                  │
+│  (most ops peeled to unigateway)                             │
 └───────────────────────────────┬─────────────────────────────┘
-                                │ clean internal protocol
-                                │ (GenerationRequest / delta tokens)
+                                │ protocol or PyO3
 ┌───────────────────────────────▼─────────────────────────────┐
-│  Python Execution Core                                       │
+│  Python Execution Core (pure library)                        │
 │  ┌──────────────────────┐   ┌───────────────────────────┐   │
 │  │   KVCacheManager     │◄──┤   RadixTree (token seq)   │   │
 │  │   (pages / blocks)   │   │   prefix match + evict    │   │
@@ -46,12 +44,12 @@ Everything else is pushed out or treated as thin adapter.
 │  └──────────────────────┘   └───────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ ModelRunner (torch + flash / triton)                 │   │
-│  │   • CUDA graph capture for decode phase              │   │
-│  │   • Quant loader (FP8/AWQ thin wrappers)             │   │
-│  │   • Prefill (full) / decode (incremental)            │   │
+│  │   • MoE routing + expert execution                   │   │
+│  │   • CUDA graph (optional)                            │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                              │
 │  (Tokenizer & HF model registry — thin reuse)               │
+│  (hooks for metrics/logging; export peeled to gateway)      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -106,7 +104,7 @@ class Scheduler:
 
 ## Model Support Strategy
 
-- Only register **dense** models we explicitly support.
+- Only register popular **MoE** models (dense models are out of scope).
 - Use HF `AutoModelForCausalLM` + `AutoTokenizer` initially for loading.
 - Later: direct safetensors weight loading + custom modeling files for speed (like nano-vLLM style).
 - Extension point: small model registry + loader trait.

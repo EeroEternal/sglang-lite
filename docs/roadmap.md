@@ -39,7 +39,7 @@ Goal: A runnable system that proves the architecture and can serve real (small) 
 - Scheduler that actually does continuous batching (add prefill, promote decode sequences, manage seq lens)
 - CUDA graph capture around decode forward (the big win)
 - Real quant support (at least AWQ + FP8 path with correct memory accounting)
-- Good model support matrix for Llama-3.1/3.2/4 + Qwen2.5/3 dense (up to 72B single node + TP)
+- Good model support matrix for popular MoE models only (DeepSeek, Qwen-MoE, Mixtral 等; up to 70B+ class). Dense models are out of scope.
 - Prometheus + /metrics, structured logging, graceful drain
 - Configuration system with "lite" preset (very few flags)
 - Request timeout, max concurrent, queue limits
@@ -76,4 +76,20 @@ See scope.md "不做" list. If a feature is desired by many users, the correct a
 - Issues / milestones will mirror the phases.
 - Every merged PR should update this file or link the changed scope.
 
-Current status: **Phase 0 largely complete** (framework + control plane solid, real Radix + scheduler + runner working on CPU, full-stack integration verified, prefix sharing demo passes).
+Current status: **Phase 1 in progress — MoE-only scope** (reassessed 2026-06-28)
+
+**Phase 0 complete** — v0.1.0
+
+Reassessed boundary: sglang-lite now targets **MoE models only**. Dense models are explicitly out of scope. Primary focus on popular MoE (DeepSeek, Qwen-MoE, Mixtral-style, etc.). The engine is a pure library. Serving and cross-cutting concerns are peeled to unigateway or thin layers. The engine remains high-cohesion and "lite".
+
+## Phase 1 Deliverables (all completed)
+- [x] Prometheus + /metrics (Python + Rust)
+- [x] Structured logging + request_id
+- [x] Config system ("lite" preset + env/CLI)
+- [x] Robustness: timeouts, max_concurrent, queue limits
+- [x] Benchmark script
+- [x] Scheduler improvements (batching, eviction)
+- [x] OpenAI error normalization
+- [x] Graceful shutdown via server runtimes
+
+Non-goals for Phase 1: CUDA graph, 70B perf, full paged attention.

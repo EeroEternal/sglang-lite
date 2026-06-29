@@ -4,7 +4,11 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 ## One-sentence Mission
 
-> An extremely cohesive production token generator for dense models. Everything not required to reliably turn requests into token streams at high throughput stays outside.
+> An extremely cohesive production token generator primarily for MoE models. Everything not required to reliably turn requests into token streams at high throughput stays outside.
+
+The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
+
+Serving (HTTP/gRPC server), advanced config, detailed observability, auth/rate-limit, and routing are peeled to unigateway or thin wrappers. sglang-lite is a pure library for the Token Factory.
 
 ## Classification Rules
 
@@ -32,9 +36,9 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 | **Execution**                  | Prefill handling                        | **重构**      | Must coordinate with KV allocation.                                                               | -                                        | P0       |
 | **Execution**                  | Basic quantization (BF16/FP8/AWQ)       | Hybrid         | Loader can be reused; the memory accounting + forward path must be owned.                         | SGLang loader pieces + thin wrapper      | P0       |
 | **Execution**                  | Attention kernel (flash, triton)        | Hybrid         | Call specific kernels. Do **not** take their high-level schedulers.                               | flashinfer / sgl-kernel / custom triton  | P0       |
-| **Model Support**              | Llama-family, Qwen2.5/3 dense, Mistral  | 直接引用      | HF + proven loading paths. Limit to dense only.                                                   | Register only approved model families    | P0       |
+| **Model Support**              | Popular MoE (DeepSeek, Qwen-MoE, Mixtral 等) | 直接引用 | HF + proven loading paths. MoE is first-class (dense models explicitly out of scope).             | Register approved MoE families only      | P0       |
 | **Model Support**              | Tokenizer (HF)                          | 直接引用      | Mature, no point reimplementing.                                                                  | -                                        | P0       |
-| **Model Support**              | New dense model quick add               | **重构**      | Registry + loader hook only. No deep per-model hacks in core.                                     | Simple config + extension point          | P1       |
+| **Model Support**              | New MoE model quick add                 | **重构**      | Registry + loader hook only. Support for common MoE patterns.                                     | Simple config + extension point          | P1       |
 | **Observability**              | Prometheus (t/s, cache_hit, batch, q)   | **重构**      | Only the metrics that matter for this lite scope.                                                 | -                                        | P0       |
 | **Observability**              | Structured logs + request id            | **重构**      | Correlate across unigateway / engine.                                                             | -                                        | P0       |
 | **Observability**              | Graceful shutdown + health              | **重构**      | 3am stability.                                                                                        | -                                        | P0       |
@@ -42,22 +46,27 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 | **Advanced**                   | Prefill / Decode disaggregation         | **不做**      | Distributed systems concern, not single-node token factory.                                       | Future "advanced" mode                   | -        |
 | **Advanced**                   | Dynamic multi-LoRA / hot swap           | **不做**      | Huge complexity for narrow win.                                                                   | -                                        | -        |
 | **Advanced**                   | Multimodal encoders                     | **不做**      | Completely different data and execution path.                                                     | Separate multimodal service              | -        |
-| **Advanced**                   | MoE expert parallelism                  | **不做** (MVP)| Different memory + scheduling model.                                                              | Extension only                           | -        |
+| **Advanced**                   | Full expert parallelism + advanced load balancing | **Hybrid** | Lite focuses on efficient routing + batching + Radix on shared parts. Full EP is advanced. | Basic MoE in core; advanced EP later     | P1       |
 
 ## Summary Counts (MVP)
 
 - **重构** (own completely): 12+
-- **Hybrid** (reuse pieces, own path): 3
+- **Hybrid** (reuse pieces, own path): 4
 - **直接引用** (infrastructure): ~4 (tokenizers, HF loaders, basic quant loaders, kernel functions)
-- **明确不做**: 7+
+- **明确不做**: 6+
 
-This ratio is intentional. The value of lite is disciplined reduction of accidental complexity.
+MoE support is now first-class. The "lite" philosophy remains: keep the core (KV + Scheduler + Runner) highly cohesive and as simple as possible while making popular MoE models work well with Radix prefix sharing and continuous batching.
 
-## What "Lite" Means in Practice
+Serving (HTTP server), config management, advanced observability, auth/rate-limit, and routing are explicitly peeled to unigateway or thin dedicated projects. sglang-lite is a pure engine library.
+
+## What "Lite" Means in Practice (MoE-only)
 
 - Very small number of startup flags (sensible presets).
 - Predictable behavior under load.
 - Easy to reason about one request's journey through the system.
+- MoE routing is handled cleanly in the runner. Scheduler and KV Cache stay focused on throughput and prefix sharing rather than full expert scheduling complexity.
+- Dense models are explicitly out of scope (no compatibility).
+- Serving, ops, and cross-cutting concerns are peeled to unigateway or dedicated thin layers. The core is a pure library.
 - Codebase should stay small enough that a single engineer can hold the mental model.
 
 ## Enforcement

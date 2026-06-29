@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sglang-lite"
 version = "0.1.0"
-description = "sglang-lite Python execution core (Radix KV + continuous batching scheduler + model runner)"
+description = "sglang-lite Python execution core (pure library): Radix KV + MoE-aware continuous batching scheduler + model runner for popular MoE models"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -16,6 +16,7 @@ dependencies = [
     "torch>=2.3",
     "transformers>=4.40",
     "sentencepiece>=0.2",
+    # prometheus-client is optional (peeled to serving layer)
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,8 @@ dev = ["ruff", "pytest"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
+include = ["sglang_lite*"]
+exclude = ["sglang_lite.server*"]
 
 [tool.ruff]
 line-length = 100

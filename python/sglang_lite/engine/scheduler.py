@@ -63,16 +63,26 @@ class Scheduler:
         radix_cache: RadixCache,
         max_batch_size: int = 8,          # smaller on CPU
         max_tokens_per_batch: int = 512,
+        max_waiting: int = 128,
     ):
         self.radix = radix_cache
         self.max_batch_size = max_batch_size
         self.max_tokens_per_batch = max_tokens_per_batch
+        self.max_waiting = max_waiting
 
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Sequence] = []
         self._next_seq_id = 1
 
     def add_request(self, request_id: str, input_ids: List[int]) -> Sequence:
+        if len(self.waiting) >= self.max_waiting:
+            # Simple queue limit: evict oldest waiting if possible
+            if self.waiting:
+                old = self.waiting.popleft()
+                self.radix.release_blocks(getattr(old, 'allocated_blocks', []))
+            else:
+                raise RuntimeError("queue full and no eviction possible")
+
         seq = Sequence(
             seq_id=self._next_seq_id,
             request_id=request_id,
@@ -103,7 +113,7 @@ class Scheduler:
         batch: List[Sequence] = []
         is_prefill: List[bool] = []
 
-        # 1. Admit new work from waiting
+        # 1. Admit new work from waiting (prefer those with cache hits if possible)
         while self.waiting and len(batch) < self.max_batch_size:
             seq = self.waiting.popleft()
             batch.append(seq)
@@ -111,12 +121,20 @@ class Scheduler:
             is_prefill.append(needs_prefill)
 
         # 2. Keep running decode sequences (they have finished their prompt)
-        for seq in list(self.running):
-            if not seq.finished and len(batch) < self.max_batch_size:
+        # Promote decodes preferentially for continuous batching
+        decodes = [s for s in self.running if not s.finished and s.cached_len >= len(s.input_ids)]
+        for seq in decodes:
+            if len(batch) < self.max_batch_size:
                 batch.append(seq)
                 is_prefill.append(False)
 
-        # Cap the batch (very simple policy)
+        # Fill remaining with other running if any
+        for seq in list(self.running):
+            if not seq.finished and len(batch) < self.max_batch_size and seq not in batch:
+                batch.append(seq)
+                is_prefill.append(False)
+
+        # Simple cap
         if len(batch) > self.max_batch_size:
             excess = batch[self.max_batch_size :]
             batch = batch[: self.max_batch_size]

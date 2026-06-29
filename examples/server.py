@@ -1,29 +1,59 @@
 """
-Internal HTTP server for the real sglang-lite Python execution core.
+Example thin server (peeled out of core).
 
-Uses the full LiteEngine (Radix + Scheduler + real Runner).
+sglang-lite core is a pure library. This example shows a minimal
+HTTP server built on top.
+
+Serving, routing, auth, advanced metrics, etc. belong in unigateway
+or a dedicated thin server.
 
 Run:
-    PYTHONPATH=python python -m sglang_lite.server --port 9001 --model stub
+    python examples/sglang_lite_server.py --port 9001 --model ...
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+import time
 import uuid
 from typing import List, Optional
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, StreamingResponse
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 
-from .engine.engine import LiteEngine
+import sys
+sys.path.insert(0, "python")
+
+from sglang_lite.config import Config
+from sglang_lite.engine.engine import LiteEngine
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger("sglang_lite_server")
+
+def _log(msg: str, **kwargs):
+    log_data = {"ts": time.time(), "msg": msg, **kwargs}
+    logger.info(json.dumps(log_data))
 
 app = FastAPI(title="sglang-lite Python Core (real engine)")
 
 # Global engine
 ENGINE: Optional[LiteEngine] = None
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    req_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:12]
+    request.state.request_id = req_id
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    _log("http_request", request_id=req_id, method=request.method, path=str(request.url.path), duration=duration, status=response.status_code)
+    response.headers["x-request-id"] = req_id
+    return response
 
 
 class GenRequest(BaseModel):
@@ -64,17 +94,19 @@ def _extract_input_ids(req: GenRequest) -> List[int]:
 
 
 @app.post("/generate", response_model=GenResult)
-async def generate(req: GenRequest):
+async def generate(req: GenRequest, request: Request):
     global ENGINE
-    rid = req.request_id or f"req-{uuid.uuid4().hex[:12]}"
+    rid = req.request_id or getattr(request.state, "request_id", f"req-{uuid.uuid4().hex[:12]}")
     input_ids = _extract_input_ids(req)
 
+    _log("generate_start", request_id=rid, max_tokens=req.max_tokens)
     result = ENGINE.generate(
         rid,
         input_ids,
         max_tokens=req.max_tokens,
         temperature=req.temperature,
     )
+    _log("generate_end", request_id=rid, finish_reason=result.get("finish_reason"))
     return GenResult(
         text=result["text"],
         finish_reason=result.get("finish_reason"),
@@ -113,24 +145,37 @@ async def health():
 async def stats():
     return ENGINE.get_stats() if ENGINE else {}
 
+@app.get("/metrics")
+async def metrics():
+    from fastapi.responses import Response
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9001)
     parser.add_argument("--model", type=str, default="stub")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--max-batch-size", type=int, default=4)
+    parser.add_argument("--max-concurrent", type=int, default=32)
     args = parser.parse_args()
 
-    global ENGINE
-    ENGINE = LiteEngine(
-        model_name=args.model,
-        device=args.device,
-        max_batch_size=4,
-    )
+    cfg = Config.from_env("lite")
+    # Override with CLI args if provided
+    if args.model != "stub":
+        cfg.model = args.model
+    if args.device != "cpu":
+        cfg.device = args.device
+    cfg.port = args.port
+    cfg.max_batch_size = args.max_batch_size
+    cfg.max_concurrent = args.max_concurrent
 
-    print(f"[sglang-lite-core] Real engine starting on :{args.port}")
-    print(f"  model={args.model}  device={args.device}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
+    global ENGINE
+    ENGINE = LiteEngine(config=cfg)
+
+    print(f"[sglang-lite-core] Phase 1 engine starting on :{args.port}")
+    print(f"  config: {cfg.to_dict()}")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level=cfg.log_level.lower())
 
 
 if __name__ == "__main__":

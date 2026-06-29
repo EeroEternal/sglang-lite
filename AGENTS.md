@@ -13,7 +13,7 @@ sglang-lite 是一个**极致高内聚的 Token Factory（令牌工厂）**。
   2. Scheduler（continuous batching 连续批处理）
   3. ModelRunner（重度使用 CUDA graph 的 decode 执行）
 - **Rust 层是对外的控制点**（OpenAI 协议适配层）。所有请求验证、早期拒绝、streaming 控制、错误处理都必须在这里完成。
-- 一切业务逻辑（agent loop、structured output、多模态、tool calling 执行等）**必须上移**到 unigateway / IntentLoop / Zene / gateway 层。
+- 一切业务逻辑（agent loop、structured output、多模态、tool calling 执行等）、serving、配置、详细可观测性**必须上移**到 unigateway / gateway 层或独立薄层。sglang-lite 是纯引擎库。
 - 遇到不确定时，**优先缩小 scope**，宁可删减功能，也不要增加复杂度。
 
 变更前必须阅读的文档：
@@ -58,11 +58,11 @@ sglang-lite 是一个**极致高内聚的 Token Factory（令牌工厂）**。
 
 ## 模型支持策略
 
-只支持**主流 dense 模型**（Llama 系列、Qwen2.5/3 dense、Mistral 等）。
+**只支持主流 MoE 模型**（DeepSeek、Qwen-MoE、Mixtral 等）。Dense 模型不在支持范围内。
 新增模型必须满足：
 1. 通过 tokenization + 短生成测试
 2. 更新 scope.md 中的支持列表
-3. 不引入 MoE 或多模态特殊处理
+3. 只支持 MoE 模型，不支持 dense 模型。MoE 支持以路由 + 高效 batching 为主，不引入过度复杂的专家并行。
 
 ## 推荐工作流程
 

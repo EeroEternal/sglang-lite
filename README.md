@@ -21,7 +21,7 @@ SGLang and vLLM are powerful, but their **accidental complexity** has become ove
 
 sglang-lite follows a **high-cohesion** design:
 - KV Cache full lifecycle + Scheduler + Execution must be tightly coupled as the core.
-- Everything else (business logic) is pushed upward.
+- Everything else (serving, routing, auth, advanced observability, business logic) is peeled to unigateway or thin layers.
 
 The goal is to achieve stable 80%+ of theoretical throughput in target scenarios (prefix-heavy chat/agent) with extremely low operational burden.
 
@@ -68,29 +68,31 @@ References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.
 
 **Classification summary**: ~12+ full control/rewrite, small amount direct reuse (infrastructure), Hybrid transition, several out of scope.
 
-## Recommended Architecture (Rust + Python Hybrid)
+## Recommended Architecture (Rust + Python Hybrid) — Library First
+
+sglang-lite is a **pure library**. Serving and cross-cutting concerns are peeled to unigateway or thin wrappers.
 
 ```
 Client / unigateway
-        ↓ (OpenAI)
-[Rust API Layer]  (axum + tokio)   <--- Control point (must own this)
-  - Strict validation + early reject
-  - Clean internal GenerationRequest
-  - Streaming control + error normalization
-  - Metrics, auth hook, rate limit hook
-        ↓ (HTTP/gRPC / PyO3 / channel)
-[Python Core Engine] (Triton / FlashInfer / torch)
-  - KVCacheManager (Radix first)
-  - ContinuousBatchingScheduler
-  - ModelRunner + CUDA Graph capture
+        ↓ (OpenAI + routing/auth)
+[Rust API Layer] (axum, optional)  <--- Thin control point
+  - Minimal validation + early reject
+  - Streaming + thin call to engine
+        ↓ (HTTP/gRPC or PyO3)
+[Python Core Engine] (pure library)
+  - KVCacheManager (Radix)
+  - ContinuousBatchingScheduler (MoE-aware)
+  - ModelRunner (routing + execution)
         ↑ token stream + usage
 ```
 
+Serving, metrics export, config, graceful shutdown live in unigateway or dedicated thin server (see examples/).
+
 **Why this combination?**
 
-- Rust: Type safety, low-overhead streaming, seamless integration with unigateway, full control over the entry contract.
-- Python + Triton: The current ecosystem has the most mature kernel/CUDA graph/KV implementations and fastest iteration. Follows the nano-vLLM path.
-- Incremental: Use the Python core to get real workloads running first, then consider moving hot paths to Rust via PyO3.
+- Rust (optional thin layer): Type safety for the API surface and easy early rejection.
+- Python + Triton: Mature kernels and fast iteration for the core engine.
+- Library first: The Python engine is a pure library. Serving, ops, and advanced features are peeled to unigateway or examples/. This keeps sglang-lite minimal and high-cohesion.
 
 **Communication (MVP)**: Start with local HTTP (loose coupling, easy to debug), or gRPC. Tighten with PyO3 later.
 
