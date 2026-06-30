@@ -42,8 +42,8 @@
 - 能够通过 UniGateway 的 capability 系统暴露给上层。
 
 ### 4. 执行路径
-- 优先支持 **direct Python library 调用**（通过 PyO3 或同进程嵌入）。
-- 也应支持通过 gRPC / 子进程 / HTTP 的远程调用方式（作为备选）。
+- 优先支持 **direct Python library 调用**（通过 PyO3 在 Rust 进程中直接嵌入 Python 引擎，或同进程调用）。
+- 也应支持通过 gRPC / 子进程 / HTTP 的远程调用方式（作为备选，解耦更强但延迟更高）。
 - 充分利用 `sglang-lite` 的 Radix 前缀缓存能力，实现高效的 prefix sharing。
 
 ### 5. 流式与协议兼容
@@ -99,3 +99,24 @@
 - unigateway: （当前仓库）
 
 请在实现时优先保证 UniGateway 的通用性和可嵌入性。
+
+---
+
+## 附：为什么提到 PyO3？
+
+在“执行路径”一节中提到了“通过 PyO3 或同进程嵌入”，原因是：
+
+- unigateway 主体是 Rust。
+- sglang-lite 的核心引擎是 Python 库（`sglang_lite.engine.LiteEngine`）。
+- 如果想在 unigateway（Rust 进程）里**直接、低开销地**调用 sglang-lite 引擎（而不是通过 HTTP/gRPC 连另一个 Python 进程），就需要 PyO3 作为 Rust ↔ Python 的 FFI 桥梁。
+
+**使用 PyO3 的优势**：
+- 极低的调用延迟（对 continuous batching 和 streaming 很重要）。
+- 可以直接在同一个进程内操作 Python 对象，减少序列化开销。
+- 便于 unigateway 直接管理 engine 的生命周期和资源。
+
+**不使用 PyO3 的替代方案**：
+- Rust driver 通过 gRPC/HTTP 调用一个独立的 sglang-lite Python 进程。
+- 这种方式解耦更好、部署更灵活，但有额外的网络/序列化开销。
+
+PyO3 不是强制要求，而是“高性能直连”路径的实现方式之一。需求里同时列出了两种选项，unigateway 团队可以根据实际情况选择。
