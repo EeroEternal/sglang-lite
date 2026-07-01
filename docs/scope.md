@@ -8,11 +8,12 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 The engine focuses exclusively on popular MoE architectures (Mixtral-style, DeepSeek-style, Qwen-MoE, etc.). Dense models are out of scope. MoE support is first-class.
 
-**unigateway is the backend driver** (driver code lives in the unigateway repo):
-- It loads and drives the sglang-lite engine (preferred: direct Python library import from unigateway).
-- All serving (HTTP/gRPC), routing, auth, rate-limit, advanced config, observability export, graceful shutdown, admission control, and timeouts live in unigateway.
-- Any backend registration, connection management, or driver glue moves to unigateway.
-- sglang-lite remains a minimal pure library (only the three high-cohesion pieces).
+sglang-lite is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The orchestrator and most policy logic live in the driver.
+
+**unigateway as backend driver** (driver code lives in the unigateway repository):
+- Uses the three building blocks directly (unigateway owns the main loop and admission control).
+- Handles all serving, routing, auth, rate-limit, advanced config, metrics export, graceful shutdown, etc.
+- sglang-lite only owns the high-cohesion core pieces (internal decomposition is allowed for modularity).
 
 ## Classification Rules
 
@@ -30,16 +31,12 @@ The engine focuses exclusively on popular MoE architectures (Mixtral-style, Deep
 | **API Layer (Rust)**           | Request validation & internal mapping   | **重构**      | Define clean GenerationRequest here.                                                              | -                                        | P0       |
 | **API Layer (Rust)**           | Tool calls (function calling)           | **重构**      | Only placeholder shape + clear error. Execution belongs in harness.                               | Gateway layer                            | P1       |
 | **API Layer**                  | Structured / JSON mode                  | **不做**      | Requires FSM / constrained decoding. Breaks token-factory cohesion.                               | outlines / xgrammar in gateway           | -        |
-| **KV & Memory**                | RadixAttention (prefix tree reuse)      | **重构**      | LLM-specific memory problem + scheduler are inseparable. SGLang's biggest strength for agent chat. | - (default)                              | P0       |
-| **KV & Memory**                | PagedAttention (block table)            | **重构**      | Pluggable alternative for general workloads. Reuse memory pool infra from Radix impl.             | config switch                            | P1       |
-| **KV & Memory**                | Eviction, fragmentation, OOM handling   | **重构**      | Must live with scheduler decisions.                                                               | -                                        | P0       |
-| **Scheduling**                 | Continuous batching                     | **重构**      | Core throughput mechanism. Coupled to cache state.                                                | -                                        | P0       |
-| **Scheduling**                 | Waiting queue + admission + timeout     | **重构**      | Production robustness is scheduler's job.                                                         | -                                        | P0       |
-| **Scheduling**                 | Simple priority (FCFS + basic)          | **重构**      | Fairness without over-engineering.                                                                | -                                        | P0       |
-| **Execution**                  | Heavy CUDA graph for decode             | **重构**      | Biggest single lever for low CPU overhead & high decode throughput.                               | -                                        | P0       |
-| **Execution**                  | Prefill handling                        | **重构**      | Must coordinate with KV allocation.                                                               | -                                        | P0       |
-| **Execution**                  | Basic quantization (BF16/FP8/AWQ)       | Hybrid         | Loader can be reused; the memory accounting + forward path must be owned.                         | SGLang loader pieces + thin wrapper      | P0       |
-| **Execution**                  | Attention kernel (flash, triton)        | Hybrid         | Call specific kernels. Do **not** take their high-level schedulers.                               | flashinfer / sgl-kernel / custom triton  | P0       |
+| **KV & Memory**                | RadixKVCache (composed of RadixTree + KVAllocator + Eviction) | **重构** | Core for MoE prefix sharing. Internal pieces are further decomposed for composability by the driver. | - (default) | P0       |
+| **KV & Memory**                | Memory budget / eviction policy         | **重构** (partial) | Can be replaced; unigateway may provide policy. | - | P1       |
+| **Scheduling**                 | BatchingScheduler (SequenceTable + BatchFormer) | **重构** | Core continuous batching. Admission/queueing peeled to unigateway driver. | - | P0       |
+| **Scheduling**                 | MoE-aware batch formation               | **重构** (partial) | BatchFormer can be supplied by unigateway. | - | P1       |
+| **Execution**                  | MoEModelRunner (composed: Router + Prefill/Decode Executors + KernelBackend) | **重构** | Routing + execution for MoE. Composed internally so pieces can be swapped. | - | P0       |
+| **Execution**                  | CUDA graph (conservative for MoE)       | **重构** (optional) | Big win when possible; unigateway can choose execution strategy. | - | P0       |
 | **Model Support**              | Popular MoE (DeepSeek, Qwen-MoE, Mixtral 等) | 直接引用 | HF + proven loading paths. MoE is first-class (dense models explicitly out of scope).             | Register approved MoE families only      | P0       |
 | **Model Support**              | Tokenizer (HF)                          | 直接引用      | Mature, no point reimplementing.                                                                  | -                                        | P0       |
 | **Model Support**              | New MoE model quick add                 | **重构**      | Registry + loader hook only. Support for common MoE patterns.                                     | Simple config + extension point          | P1       |
@@ -59,17 +56,17 @@ The engine focuses exclusively on popular MoE architectures (Mixtral-style, Deep
 - **直接引用** (infrastructure): ~4 (tokenizers, HF loaders, basic quant loaders, kernel functions)
 - **明确不做**: 6+
 
-MoE support is now first-class. The "lite" philosophy remains: keep the core (KV + Scheduler + Runner) highly cohesive and as simple as possible while making popular MoE models work well with Radix prefix sharing and continuous batching.
+MoE support is first-class. The three core pieces are now further decomposed internally (RadixKVCache, BatchingScheduler, MoEModelRunner) so that unigateway (as driver) can own composition and policy.
 
-Serving (HTTP server), config management, advanced observability, auth/rate-limit, and routing are explicitly peeled to unigateway or thin dedicated projects. sglang-lite is a pure engine library.
+sglang-lite is an ultra-minimal pure library. Serving, config, observability, admission, etc. are peeled to unigateway.
 
 ## What "Lite" Means in Practice (MoE-only)
 
 - Very small number of startup flags (sensible presets).
 - Predictable behavior under load.
 - Easy to reason about one request's journey through the system.
-- MoE routing is handled cleanly in the runner. Scheduler and KV Cache stay focused on throughput and prefix sharing rather than full expert scheduling complexity.
-- Dense models are explicitly out of scope (no compatibility).
+- The three building blocks are internally decomposed for modularity. unigateway (the driver) owns the main loop and higher-level policies.
+- Dense models are explicitly out of scope.
 - Serving, ops, and cross-cutting concerns are peeled to unigateway or dedicated thin layers. The core is a pure library.
 - Codebase should stay small enough that a single engineer can hold the mental model.
 

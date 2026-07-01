@@ -21,30 +21,38 @@ from .kv_cache import RadixCache, PastKV
 
 @dataclass
 class Sequence:
+    """Lightweight sequence descriptor. Lifecycle mostly managed by the driver (unigateway)."""
     seq_id: int
     request_id: str
-
-    # Full original prompt token ids
     input_ids: List[int]
-
-    # Tokens generated so far
     output_ids: List[int] = field(default_factory=list)
-
-    # How far into input_ids has been processed (including prefix cache hit)
     cached_len: int = 0
-
-    # Current KV state for this sequence (owned or forked from radix)
     kv_state: Optional[PastKV] = None
-
     created_ts: float = field(default_factory=time.time)
     last_token_ts: float = field(default_factory=time.time)
-
     finished: bool = False
     finish_reason: str = ""
-
-    # Simple stats for this sequence
     prefill_tokens: int = 0
     decode_tokens: int = 0
+
+
+class SequenceTable:
+    """Manages active sequences. Can be driven by unigateway."""
+    def __init__(self):
+        self.sequences: Dict[int, Sequence] = {}
+        self._next_id = 1
+
+    def create(self, request_id: str, input_ids: List[int]) -> Sequence:
+        seq = Sequence(seq_id=self._next_id, request_id=request_id, input_ids=list(input_ids))
+        self._next_id += 1
+        self.sequences[seq.seq_id] = seq
+        return seq
+
+    def get(self, seq_id: int) -> Optional[Sequence]:
+        return self.sequences.get(seq_id)
+
+    def remove(self, seq_id: int):
+        self.sequences.pop(seq_id, None)
 
 
 class Scheduler:
@@ -72,16 +80,12 @@ class Scheduler:
 
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Sequence] = []
-        self._next_seq_id = 1
+        self.batch_former = BatchFormer(max_batch_size, max_tokens_per_batch)
+        # Note: max_waiting / admission can be handled by unigateway driver
 
     def add_request(self, request_id: str, input_ids: List[int]) -> Sequence:
-        if len(self.waiting) >= self.max_waiting:
-            # Simple queue limit: evict oldest waiting if possible
-            if self.waiting:
-                old = self.waiting.popleft()
-                self.radix.release_blocks(getattr(old, 'allocated_blocks', []))
-            else:
-                raise RuntimeError("queue full and no eviction possible")
+        # Admission logic (max_waiting, eviction on queue) is typically handled by unigateway.
+        # The scheduler here assumes the request has already been admitted.
 
         seq = Sequence(
             seq_id=self._next_seq_id,
@@ -106,43 +110,11 @@ class Scheduler:
 
     def step(self) -> Tuple[List[Sequence], List[bool]]:
         """
-        Returns:
-            batch: list of sequences to run this step
-            is_prefill: parallel list, True if this sequence still needs prefill
+        Form next batch using BatchFormer (which unigateway can replace).
         """
-        batch: List[Sequence] = []
-        is_prefill: List[bool] = []
+        batch, is_prefill = self.batch_former.form_batch(self.waiting, self.running)
 
-        # 1. Admit new work from waiting (prefer those with cache hits if possible)
-        while self.waiting and len(batch) < self.max_batch_size:
-            seq = self.waiting.popleft()
-            batch.append(seq)
-            needs_prefill = seq.cached_len < len(seq.input_ids)
-            is_prefill.append(needs_prefill)
-
-        # 2. Keep running decode sequences (they have finished their prompt)
-        # Promote decodes preferentially for continuous batching
-        decodes = [s for s in self.running if not s.finished and s.cached_len >= len(s.input_ids)]
-        for seq in decodes:
-            if len(batch) < self.max_batch_size:
-                batch.append(seq)
-                is_prefill.append(False)
-
-        # Fill remaining with other running if any
-        for seq in list(self.running):
-            if not seq.finished and len(batch) < self.max_batch_size and seq not in batch:
-                batch.append(seq)
-                is_prefill.append(False)
-
-        # Simple cap
-        if len(batch) > self.max_batch_size:
-            excess = batch[self.max_batch_size :]
-            batch = batch[: self.max_batch_size]
-            is_prefill = is_prefill[: self.max_batch_size]
-            for s in excess:
-                if not s.finished and s not in self.running:
-                    self.waiting.appendleft(s)
-
+        # Update running list
         self.running = [s for s, p in zip(batch, is_prefill) if not s.finished]
         return batch, is_prefill
 

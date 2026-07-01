@@ -102,6 +102,22 @@
 
 ---
 
+## 附录：关于“unigateway 是 SDK 而不是二进制”的说明
+
+unigateway 本身定位为**库 workspace**（SDK），这和把 sglang-lite driver 放在它里面是完全兼容的：
+
+- 从 unigateway 自己的 AGENTS.md 可以看到：
+  > “UniGateway 是面向嵌入方的本地优先 LLM **库 workspace** … HTTP、CLI、用户与租户管理由宿主应用自行实现。”
+
+- 它的核心价值就是提供通用的 `ProviderDriver` 抽象、协议翻译、路由、引擎封装等。
+- 添加一个 `SglangLiteDriver`（实现 `ProviderDriver`），只是多了一种 backend 支持，和支持 OpenAI、Anthropic 是一个性质。
+- 真正的“二进制可执行文件”（监听端口、处理 HTTP 请求的服务器）仍然由**宿主应用**（使用 unigateway 的网关产品）来提供。
+- sglang-lite 相关的特殊处理（本地 MoE、Radix 前缀缓存、direct import 等）应该隔离在 driver 实现里，不会污染 unigateway 核心抽象的通用性。
+
+因此，把 sglang-lite 驱动放在 unigateway 里，不仅合适，而且是它作为通用 SDK 应该做的事情。
+
+---
+
 ## 附：为什么提到 PyO3？
 
 在“执行路径”一节中提到了“通过 PyO3 或同进程嵌入”，原因是：

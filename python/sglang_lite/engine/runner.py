@@ -1,11 +1,13 @@
 """
-ModelRunner with real incremental generation + Radix KV reuse.
+MoEModelRunner composed of smaller pieces for composability.
 
-This is one of the three high-cohesion pieces.
-It knows how to:
-- Run prefill on new prompt tokens (using cached KV if available)
-- Run single-token decode using past_key_values
-- Return updated KV state so the scheduler / radix can store it
+High-level components (unigateway can compose or replace):
+- ModelLoader
+- MoERouter
+- PrefillExecutor / DecodeExecutor
+- KernelBackend
+
+sglang-lite only provides default implementations focused on popular MoE patterns.
 """
 
 from __future__ import annotations
@@ -19,7 +21,15 @@ from .kv_cache import RadixCache, PastKV
 from .scheduler import Sequence
 
 
-class ModelRunner:
+class MoERouter:
+    """Default MoE router. Can be replaced for custom routing strategies."""
+    def route(self, input_ids: List[int]) -> List[int]:
+        # Placeholder: real implementation would use the model's router weights.
+        # For now return dummy expert ids.
+        return [0] * len(input_ids)
+
+
+class ModelRunner:  # kept for backward compat in examples; prefer MoEModelRunner
     def __init__(self, model_name: str = "stub", device: str = "cpu", max_batch: int = 4):
         self.model_name = model_name
         self.device = device

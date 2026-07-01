@@ -1,16 +1,25 @@
 # sglang-lite Architecture
 
-## Guiding Principle: High Cohesion
+## Guiding Principle: High Cohesion + Composability
 
-The engine is a **Token Factory**.
+sglang-lite remains a **pure library** whose job is to provide the three core building blocks for a MoE "Token Factory". These three must stay reasonably cohesive for performance, but we further decompose them internally so that unigateway (as the driver) can compose and control higher-level policies.
 
-Only three things belong deeply coupled inside the core:
+Core three (still the only deeply coupled pieces):
 
-1. **KVCacheManager** — allocate / reuse (Radix prefix tree) / evict / memory budget
-2. **Scheduler** — continuous batching, dynamic batch formation, fairness / timeout
-3. **ModelRunner** — prefill + decode (heavy CUDA graph on decode path) + kernel calls
+1. **RadixKVCache** (was KVCacheManager)
+   - Composed of: RadixTree + KVAllocator + MemoryBudget + EvictionPolicy
+2. **BatchingScheduler** (was Scheduler)
+   - Composed of: SequenceTable + BatchFormer + (AdmissionController can be peeled to unigateway)
+3. **MoEModelRunner** (was ModelRunner)
+   - Composed of: ModelLoader + MoERouter + PrefillExecutor + DecodeExecutor + KernelBackend
 
-Everything else is pushed out or treated as thin adapter.
+unigateway (or any host) owns:
+- The main orchestration loop (what used to be LiteEngine)
+- Admission control, request queuing, timeouts
+- Higher-level batching policy selection
+- Metrics collection, logging context, lifecycle
+
+sglang-lite only exports the fine-grained building blocks + a small default composition helper.
 
 ## Layered Architecture (MVP) — sglang-lite as pure engine, unigateway as driver
 
@@ -32,37 +41,30 @@ unigateway acts as the **backend driver** for sglang-lite (the actual driver cod
 - Detailed requirements document: `docs/unigateway-sglang-lite-requirements.md`
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Clients                               │
-└───────────────────────────────┬─────────────────────────────┘
-                                │ OpenAI
-┌───────────────────────────────▼─────────────────────────────┐
-│  unigateway (the driver & full control plane)                │
-│  • OpenAI protocol, validation, streaming                    │
-│  • Routing, auth, rate-limit, KV affinity                    │
-│  • Metrics, logging, graceful shutdown, config               │
-│  • Drives sglang-lite as backend (Python import / gRPC / proc)│
-└───────────────────────────────┬─────────────────────────────┘
-                                │ sglang-lite engine API
-┌───────────────────────────────▼─────────────────────────────┐
-│  sglang-lite (pure library — MoE Token Factory only)         │
-│  ┌──────────────────────┐   ┌───────────────────────────┐   │
-│  │   KVCacheManager     │◄──┤   RadixTree (MoE prefix)  │   │
-│  │   (Radix only)       │   │   prefix match + evict    │   │
-│  └──────────────────────┘   └───────────────────────────┘   │
-│  ┌──────────────────────┐   ┌───────────────────────────┐   │
-│  │ Continuous Batching  │◄──┤   Scheduler (MoE-aware)   │   │
-│  │   (lite)             │   │   (add seq, step, retire) │   │
-│  └──────────────────────┘   └───────────────────────────┘   │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ ModelRunner (MoE routing + execution)                │   │
-│  │   • Expert selection + basic batching                │   │
-│  │   • CUDA graph (optional, conservative)              │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                              │
-│  (Minimal tokenizer + HF MoE loader only)                   │
-│  (No serving, no advanced ops, no dense support)            │
-└─────────────────────────────────────────────────────────────┘
+Clients / unigateway (full gateway + driver)
+  • Owns: HTTP server, routing, auth, metrics, admission control,
+    request lifecycle, higher-level policies
+  • Composes sglang-lite building blocks
+        ↓ uses
+sglang-lite (pure library — only the three building blocks)
+
+  RadixKVCache
+    ├── RadixTree
+    ├── KVAllocator / MemoryManager
+    └── EvictionPolicy (can be swapped)
+
+  BatchingScheduler
+    ├── SequenceTable
+    └── BatchFormer (unigateway can supply custom policy)
+
+  MoEModelRunner
+    ├── ModelLoader
+    ├── MoERouter
+    ├── PrefillExecutor / DecodeExecutor
+    └── KernelBackend
+
+Everything else (serving, config, observability export, driver glue)
+is in unigateway or host application.
 ```
 
 **Key peelings to unigateway:**

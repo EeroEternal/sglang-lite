@@ -1,15 +1,13 @@
 """
-LiteEngine — the MoE Token Factory (pure library).
+LiteEngine (thin facade, mostly for examples).
 
-Wires together the three high-cohesion pieces:
-- RadixCache (KV with prefix sharing)
-- Scheduler (continuous batching, MoE-aware)
-- ModelRunner (expert routing + execution)
+In the recommended architecture, unigateway (the driver) owns the main loop and
+directly composes the fine-grained pieces:
+  - RadixKVCache
+  - BatchingScheduler
+  - MoEModelRunner
 
-All serving, admission control, timeouts, routing, auth, metrics export,
-config, and driver integration live in unigateway (or thin layers).
-
-This keeps sglang-lite extremely small and focused.
+This class is kept for backward compatibility and simple standalone use.
 """
 
 from __future__ import annotations
@@ -67,7 +65,6 @@ class LiteEngine:
         self.model_name = model_name
 
         self.radix = RadixCache(max_tokens=65536)
-        # Default batch size kept small for lite/MoE. Can be tuned by caller (unigateway).
         self.scheduler = Scheduler(self.radix, max_batch_size=4)
         self.runner = ModelRunner(model_name, device=device, max_batch=4)
 

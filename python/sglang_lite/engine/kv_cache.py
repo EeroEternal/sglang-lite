@@ -33,7 +33,7 @@ PastKV = List[Tuple[torch.Tensor, torch.Tensor]]
 
 @dataclass
 class RadixNode:
-    """Node in the radix tree over token ids."""
+    """Node in the radix tree over token ids (pure tree structure)."""
     tokens: List[int] = field(default_factory=list)
     children: Dict[int, "RadixNode"] = field(default_factory=dict)
     ref_count: int = 0
@@ -44,6 +44,37 @@ class RadixNode:
 
     # Rough memory usage estimate (number of tokens this prefix represents)
     prefix_len: int = 0
+
+
+class RadixTree:
+    """Pure token radix tree. KV concerns are handled by the caller (RadixCache)."""
+
+    def __init__(self):
+        self.root = RadixNode()
+
+    def walk(self, token_ids: List[int]) -> Tuple[RadixNode, List[int], int]:
+        """Walk the tree as far as possible. Returns (final_node, matched, matched_len)."""
+        node = self.root
+        matched: List[int] = []
+        i = 0
+        for tid in token_ids:
+            if tid in node.children:
+                node = node.children[tid]
+                matched.append(tid)
+                i += 1
+            else:
+                break
+        return node, matched, i
+
+    def insert_path(self, token_ids: List[int]) -> RadixNode:
+        """Create nodes for the path if missing. Returns the leaf node."""
+        node = self.root
+        for tid in token_ids:
+            if tid not in node.children:
+                node.children[tid] = RadixNode(tokens=[tid])
+            node = node.children[tid]
+            node.ref_count += 1
+        return node
 
 
 class RadixCache:
@@ -58,7 +89,7 @@ class RadixCache:
 
     def __init__(self, max_tokens: int = 65536):
         self.max_tokens = max_tokens
-        self.root = RadixNode()
+        self.tree = RadixTree()
         self._allocated_blocks: Dict[int, KVBlock] = {}
         self._next_block_id = 0
 
@@ -76,20 +107,8 @@ class RadixCache:
         Returns:
             matched_tokens, matched_len, remaining_tokens, cached_kv (or None)
         """
-        node = self.root
-        matched: List[int] = []
-        cached_kv: Optional[PastKV] = None
-        i = 0
-
-        for tid in token_ids:
-            if tid in node.children:
-                node = node.children[tid]
-                matched.append(tid)
-                i += 1
-                if node.kv_state is not None:
-                    cached_kv = node.kv_state
-            else:
-                break
+        node, matched, i = self.tree.walk(token_ids)
+        cached_kv = node.kv_state if node.kv_state is not None else None
 
         remaining = token_ids[i:]
         if cached_kv is not None:
@@ -107,28 +126,13 @@ class RadixCache:
     ) -> None:
         """
         Walk/create the path and store KV state at the end node.
-        Also store a reference on intermediate nodes when possible so that
-        shorter prefix matches can still get a usable (sliced) KV.
         """
-        node = self.root
-        current_kv = None
+        node = self.tree.insert_path(token_ids)
 
-        for idx, tid in enumerate(token_ids):
-            if tid not in node.children:
-                node.children[tid] = RadixNode(tokens=[tid])
-            node = node.children[tid]
-            node.ref_count += 1
-
-            # Store progressive KV if we can slice it
-            if kv_state is not None:
-                # For simplicity in Phase 0 we store the full KV at every node
-                # (the runner will only use up to the needed length)
-                node.kv_state = kv_state
-                node.prefix_len = prefix_len + idx + 1
-
-        # Final node gets the authoritative KV
-        node.kv_state = kv_state
-        node.prefix_len = prefix_len + len(token_ids)
+        # Store KV on the leaf and propagate for prefix matching
+        if kv_state is not None:
+            node.kv_state = kv_state
+            node.prefix_len = prefix_len + len(token_ids)
 
         # Rough accounting
         self.total_tokens_stored = max(self.total_tokens_stored, node.prefix_len)

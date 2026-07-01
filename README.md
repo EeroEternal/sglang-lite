@@ -19,12 +19,12 @@ It does **not** do: agent runtime, multimodal, built-in constrained decoding, sp
 
 SGLang and vLLM are powerful, but their **accidental complexity** has become overwhelming. Many real production workloads (multi-turn chat, RAG, tool calling) do not need the full feature set, yet they pay the price in configuration hell, debugging difficulty, and instability caused by monthly changes.
 
-sglang-lite follows a **high-cohesion** design (pure library only):
-- KV Cache full lifecycle + Scheduler + Execution must be tightly coupled as the core.
-- **unigateway is the driver and full control plane** (driver code lives in the unigateway repo) — it loads the sglang-lite engine (direct Python import preferred).
-- It owns serving, routing, auth, metrics, config, admission control, timeouts, etc.
-- All driver glue and backend integration moves to unigateway.
-- sglang-lite stays an ultra-minimal pure library.
+sglang-lite follows a **high-cohesion + composable** design (pure library):
+- The three core building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner) are the only deeply coupled pieces.
+- Each block is further decomposed internally (e.g. RadixTree + KVAllocator, BatchFormer, MoERouter + Executors).
+- **unigateway is the driver and full control plane** (driver code lives in the unigateway repo). It owns the orchestration (what used to be LiteEngine), admission control, serving, etc.
+- sglang-lite exposes the fine-grained pieces so unigateway can compose them flexibly.
+- sglang-lite is an ultra-minimal pure library.
 
 A formal requirements document has been prepared for the UniGateway team:
 
@@ -80,25 +80,24 @@ References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.
 **sglang-lite is a pure library** (MoE Token Factory only).
 
 **unigateway acts as the backend driver + full control plane:**
-- Loads and manages the sglang-lite engine (direct Python import preferred, or gRPC/process).
-- Owns the complete OpenAI surface, streaming, validation, routing, auth, rate-limit, metrics, config, etc.
-- sglang-lite only exposes the minimal engine API.
+- Owns the main orchestration loop and composes the fine-grained pieces directly:
+  RadixKVCache, BatchingScheduler, MoEModelRunner.
+- Owns complete OpenAI surface, routing, auth, metrics, config, admission control, etc.
+- sglang-lite only provides the three (internally decomposed) building blocks.
 
 ```
 Clients
   ↓ OpenAI
 unigateway (driver + control plane)
-  • Full OpenAI handling, routing, auth, metrics, config
-  • Drives sglang-lite engine (Python import / gRPC / subprocess)
-        ↓ sglang-lite library API
-sglang-lite (pure library)
-  - KVCacheManager (Radix for MoE)
-  - ContinuousBatchingScheduler (MoE-aware)
-  - ModelRunner (MoE routing + execution)
+  • Owns main loop + composes the pieces:
+      RadixKVCache + BatchingScheduler + MoEModelRunner
+  • Full OpenAI, routing, auth, metrics, admission, config...
+        ↓ uses the three blocks
+sglang-lite (pure library — building blocks only)
         ↑ tokens
 ```
 
-No serving code, no advanced ops inside sglang-lite. See `examples/` for minimal usage. All real integration lives in unigateway.
+No serving or high-level orchestration in sglang-lite. See `examples/` for driver composition patterns. All real glue lives in unigateway.
 
 **Why this combination?**
 
