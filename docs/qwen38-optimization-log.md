@@ -166,3 +166,123 @@ Qwen 新文件 Ruff 格式检查与 lint 通过，所有变更 Python 文件 AST
 3. 定义并验证实际 serving、调度与请求生命周期的最小闭环。
 4. 针对已测瓶颈优化，测多次真实 warm 中位数。
 5. 同资源分别调优两边，并保留相同结构的受控对照；验收后才迁移默认入口。
+
+## 6. Speed-only 迭代：同步清理与受控优化（2026-10-03）
+
+本轮按用户要求只优化速度，不增加服务、模型或协议功能。默认入口不变。
+新增 `scripts/qwen38_lite_bench.py`，将正确性探针与吞吐计时分开：
+
+- graph 内完成 token feedback、位置递增和 GPU 输出写入；没有逐 token
+  `.item()` / logprob / CPU token 交接。
+- 每次请求完成后仅传回一次生成 ID。11-token prefill、tokenizer 和输出 decode
+  计入 runner generation；reset、rank barrier、加载和编译不计入。
+  **不包含 serving scheduler，不能称作服务端端到端吞吐。**
+- N 个输出对应 N-1 次纯 decode replay，GPU event 按 N-1 计数。
+  输出长度不足时拒绝作为吞吐样本；记录重复 ID 是否一致。
+- TP8/EP8、attention DP1、PP1、共享专家 rank0、context capacity 4096
+  不变；同 checkpoint、GPU 预算、prompt、固定输出长度，每项三次 warm。
+  `--full-logits` 仅供 benchmark 做通信路径受控对照。
+- 最终 profile 在 position 266 开始，测四次 replay；修改过计时口径或
+  profile 起始上下文的中间试验不能直接归因到某个内核。
+
+### 6.1 无同步优化前基线
+
+Artifact：`results/qwen38-owned-speed-before.json` 及 `.trace.json`，
+均位于隔离远端 workspace，不把大 trace 或模型权重提交进 Git。
+
+| 输出数 | runner generation warm 秒 | 中位 tok/s | 纯 decode 次数 | decode 中位秒 | decode tok/s |
+|---|---|---:|---:|---:|---:|
+| 64 | 0.9266221 / 0.9124288 / 0.9233177 | 69.32 | 63 | 0.7779587 | 80.98 |
+| 128 | 1.7169757 / 1.7082654 / 1.7121925 | 74.76 | 127 | 1.5777056 | 80.50 |
+| 256 | 3.2519639 / 3.1812654 / 3.1822585 | 80.45 | 255 | 3.0521995 | 83.55 |
+
+三项重复 ID 一致。这只说明 owned runner 重复性，**不等于匹配 SGLang**。
+既有 SGLang 请求端 warm 中位数仍为 86.01 / 103.29 / 114.45 tok/s，
+未在本轮重跑；计时范围不同，不能用新 runner 数字宣称 KPI 已达成。
+
+lite rank0 四次 replay 的 kernel 时间合计 46.832 ms，不是请求 wall time：
+98 次 AllReduce/token，共 8.223 ms（17.56%）；主要 GEMV 家族
+5.747 ms（12.27%）；NVFP4 CUTLASS GEMM 4.033 ms（8.61%）。
+完整 logits AllGather 共 326.685 µs，约 81.67 µs/token（0.70%）。
+这说明通信不是唯一瓶颈，不能把标准引擎 profile 的占比套到 lite。
+
+### 6.2 保留与撤回的优化
+
+保留：
+
+1. 拆出本地 logits 计算，`step()` 保留完整 logits 的数值诊断接口；
+   `step_greedy()` 仅交换各 rank 的 `(最高分, 全局 token ID)`。
+   原来每卡发送 31,040 个 FP32 logits，现在发送两个 FP32 值。
+   checkpoint 的 token ID 小于 $2^{24}$，FP32 表示精确；本地及跨 rank
+   同分时保持最低全局 ID，与完整 argmax 一致。测试覆盖本地和跨卡分片同分。
+2. GDN immutable conv 权重加载后缓存 FP32，避免每步重复 dtype conversion；
+   保留原有 FP32 multiply/sum/SiLU、BF16 舍入顺序和 BF16 history。
+   没有合并会改变浮点计算的算子，没有 host/offload 缓存。
+
+受控候选交换单项试验（`qwen38-owned-speed-candidates-only.json`）：
+runner warm 中位数为 74.00 / 79.16 / 81.51 tok/s；
+三项输出与优化前逐 ID 完全一致。这个中间快照的 GDN 尚未缓存。
+
+撤回：
+
+- 将 GDN conv、SiLU 和 history 更新全部 `torch.compile` 融合：
+  GPU 随机叶子测试虽通过，真实模型在零基位置 43 改变了生成结果。
+  256-token 测到 83.87 tok/s，但**不作为可接受收益，也未保留代码**。
+  Artifact：`qwen38-owned-speed-candidates-conv.json`。
+- FP32 history 与 conv 权重同时缓存：输出和 teacher-forced logprob
+  与原型完全一致，但引入混合 dtype concat；短请求比仅候选交换慢约 1.5%。
+  最终缩小为只缓存 immutable 权重。中间 artifact：
+  `qwen38-owned-speed-candidates-cache.json`、
+  `qwen38-owned-speed-final.json`、`qwen38-owned-speed-final-full-logits.json`。
+
+FP32-history 中间快照的同上下文 profile 显示候选 AllGather 约
+11.44 µs/token，完整 logits 约 80.20 µs/token；候选本地 max 约
+6.54 µs/token。请求级收益并不与带宽缩减比例相等：
+候选路径的 64/128-token 请求仍慢于同快照的完整 logits 路径，
+256-token 为 82.74 对 82.04 tok/s。保留这些反例，不宣称所有长度均胜出。
+
+### 6.3 数值与验证纪律
+
+最终权重缓存快照已对照旧的 64-step teacher-forcing：
+top1 ID 和每项 selected-token logprob 完全一致，最大变化 **0.0**。
+与确定性 SGLang 的差异仍为 **63/64 top1、最大 logprob 误差
+0.2788197994**，零基位置 43 的既有问题没有被这轮性能优化解决。
+新增候选 buffer 后持久张量 rank0 为 1,651，其余各 1,459，全部 CUDA；
+审计不覆盖 NCCL host staging 或临时张量。
+最终 artifact：`qwen38-owned-teacher-64-weight-cache.json` 与八个 rank audit。
+
+Qwen GPU 叶子、benchmark 计数、源码边界、外部基线和 diagnostic 回归
+合计 **25 项通过**；本地相应轻量子集 18 项通过，7 项因无 CUDA 跳过。
+Ruff lint/format 已运行。完整 Rust、仓库全套、长上下文稀疏状态恢复
+不在本次验证范围，完整数值门禁仍未通过。
+
+### 6.4 最终测速：只缓存权重，不改 history dtype
+
+Artifact：`qwen38-owned-speed-weight-cache.json` 与同上下文 `.trace.json`。
+
+| 输出数 | runner generation warm 秒 | 中位 tok/s | 相对初始 runner | 纯 decode warm 秒（N-1 次） | decode tok/s |
+|---|---|---:|---:|---|---:|
+| 64 | 0.8530269 / 0.8521775 / 0.8520035 | 75.10 | +8.35% | 0.7262848 / 0.7263850 / 0.7262028 | 86.74 |
+| 128 | 1.5933816 / 1.5938759 / 1.5935447 | 80.32 | +7.45% | 1.4672737 / 1.4677755 / 1.4676895 | 86.53 |
+| 256 | 3.0951279 / 3.0950799 / 3.0947784 | 82.71 | +2.82% | 2.9686921 / 2.9688213 / 2.9685879 | 85.90 |
+
+全部 warm 重复 ID 一致，并与初始 runner 的对应 64/128/256 序列完全一致。
+同一最终实现的 `--full-logits` 对照
+（`qwen38-owned-speed-weight-cache-full-logits.json`）：
+
+| 输出数 | 完整 logits 路径 warm 秒 | runner 中位 tok/s | decode 中位 tok/s |
+|---|---|---:|---:|
+| 64 | 0.9306963 / 0.9127594 / 0.9057774 | 70.12 | 81.03 |
+| 128 | 1.6125985 / 1.6067015 / 1.6086596 | 79.57 | 85.71 |
+| 256 | 3.1257884 / 3.1232718 / 3.1264890 | 81.90 | 85.04 |
+
+此对照输出也完全一致。64-token 完整 logits 路径原始时长存在约 2.7%
+跨度，且中间快照出现过反向结果；收益应视作这台机器上的测量，
+不是所有长度、温度/频率、上下文或拓扑下的保证。
+两种最终路径均在 position 266 profile；候选路径 kernel 时间合计
+45.735 ms，初始为 46.832 ms。kernel 合计不是请求 wall time。
+模型测速进程结束后八卡显存均回到 2 MiB，没有留下 owned runner 占用。
+
+**结论：小幅变快，仍慢于既有标准 SGLang，未通过主 KPI 或完整数值门禁。**
+后续速度工作应集中在已测的 HC/GDN GEMV、小算子 launch、专家执行与
+98 次/token reduction，不再把 host 同步或完整 logits 当成唯一原因。

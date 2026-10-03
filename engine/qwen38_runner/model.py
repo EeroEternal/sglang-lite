@@ -52,9 +52,11 @@ class GDN:
         self.b = weights.get(prefix + ".in_proj_b.weight", hs)
         self.bias = weights.get(prefix + ".dt_bias", hs, dtype=torch.float32)
         self.log_a = weights.get(prefix + ".A_log", hs, dtype=torch.float32)
-        self.conv = torch.cat(
-            [weights.get(prefix + ".conv1d.weight", s) for s in sections]
-        ).squeeze(1)
+        self.conv = (
+            torch.cat([weights.get(prefix + ".conv1d.weight", s) for s in sections])
+            .squeeze(1)
+            .float()
+        )
         self.norm = weights.get(prefix + ".norm.weight")
         self.out = weights.get(prefix + ".out_proj.weight", cols=vs)
         self.keys, self.values = 16 // world, 48 // world
@@ -310,6 +312,7 @@ class Qwen38Runner:
             torch.empty((1, rows.stop - rows.start), device=self.device, dtype=torch.float32)
             for _ in range(world)
         ]
+        self.candidates = torch.empty((world, 2), device=self.device, dtype=torch.float32)
 
     def reset(self):
         for layer in self.layers:
@@ -318,7 +321,7 @@ class Qwen38Runner:
         self.history.fill_(248044)
 
     @torch.inference_mode()
-    def step(self, token):
+    def _local_logits(self, token):
         embedding = ops.table_lookup(self.embedding, token, self.vocab_start).reshape(1, 2560)
         dist.all_reduce(embedding)
         hidden = embedding.repeat(1, 4)
@@ -327,11 +330,22 @@ class Qwen38Runner:
             hidden = layer(hidden, token, self.history, self.position, cos, sin, self.cos, self.sin)
         hidden, _ = self.mixer.mix(hidden)
         logits = F.linear(hidden, self.head).float()
-        dist.all_gather(self.logits_parts, logits)
-        logits = torch.cat(self.logits_parts, -1)
         old = self.history.clone()
         self.history.copy_(
             torch.where(token == 248044, torch.full_like(old, 248044), torch.cat([token, old[:1]]))
         )
         self.position.add_(1)
         return logits
+
+    @torch.inference_mode()
+    def step(self, token):
+        logits = self._local_logits(token)
+        dist.all_gather(self.logits_parts, logits)
+        return torch.cat(self.logits_parts, -1)
+
+    @torch.inference_mode()
+    def step_greedy(self, token):
+        logits = self._local_logits(token)
+        candidate = ops.local_greedy_candidate(logits, self.vocab_start)
+        dist.all_gather_into_tensor(self.candidates.view(-1), candidate)
+        return ops.greedy_from_candidates(self.candidates)

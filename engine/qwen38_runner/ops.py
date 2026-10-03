@@ -39,6 +39,17 @@ def hc_combine(output, residual, normalized, inject, hidden, branches):
 
 
 @torch.compile(fullgraph=True)
+def local_greedy_candidate(logits, vocab_start):
+    score, index = logits.flatten().max(0)
+    return torch.stack([score, (index + vocab_start).float()])
+
+
+def greedy_from_candidates(candidates):
+    # Gather order is rank order, so argmax ties keep the lowest global ID.
+    return candidates[:, 1].index_select(0, candidates[:, 0].argmax().reshape(1)).long()
+
+
+@torch.compile(fullgraph=True)
 def gdn_update(q, k, v, z, b, a, bias, log_a, state, norm):
     q, k = q.float(), k.float()
     q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)

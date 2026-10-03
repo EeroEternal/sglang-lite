@@ -70,6 +70,35 @@ class QwenGpuOpsTests(unittest.TestCase):
         torch.testing.assert_close(state, expected_state, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
+    def test_greedy_candidates_match_full_argmax_including_ties(self):
+        for tied in [False, True]:
+            logits = torch.randn((8, 32), device="cuda")
+            if tied:
+                logits[1, 7] = 100
+                logits[1, 9] = 100
+                logits[5, 2] = 100
+            candidates = torch.stack(
+                [self.ops.local_greedy_candidate(logits[r], 32 * r) for r in range(8)]
+            )
+            actual = self.ops.greedy_from_candidates(candidates)
+            torch.testing.assert_close(actual, logits.flatten().argmax().reshape(1))
+
+    def test_cached_conv_weight_keeps_exact_eager_math(self):
+        history = torch.randn((1280, 3), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((1280, 4), device="cuda", dtype=torch.bfloat16)
+        cached_weight = weight.float()
+        for _ in range(8):
+            projected = torch.randn((1, 1280), device="cuda", dtype=torch.bfloat16)
+            window = torch.cat([history, projected.reshape(-1, 1)], -1)
+            expected = torch.nn.functional.silu((window.float() * weight.float()).sum(-1)).to(
+                projected.dtype
+            )
+            actual = torch.nn.functional.silu((window.float() * cached_weight).sum(-1)).to(
+                projected.dtype
+            )
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            history.copy_(window[:, 1:])
+
     def test_fp8_table_partition_does_not_read_outside_owner(self):
         table = torch.randn((32, 160), device="cuda").to(torch.float8_e4m3fn)
         ids = torch.tensor([9, 10, 41, 42], device="cuda")
