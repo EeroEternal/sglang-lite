@@ -1,5 +1,8 @@
 # DeepSeek V4-Flash 支持路线评审：先底座、后家族、最大化复用
 
+**历史技术文档**：2026-10-03 当前主目标切换为
+[Qwen3.8-Flash-Next GPU-only](./qwen38-flash-next-only.md)。下文保留 V4 技术与实测记录。
+
 状态：设计评审稿（不改变现有 scope 结论，细化执行顺序与复用边界）。
 关联文档：[scope.md](scope.md)、[standalone-inference-service-roadmap.md](standalone-inference-service-roadmap.md)、[architecture.md](architecture.md)。
 

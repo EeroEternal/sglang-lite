@@ -4,26 +4,27 @@ This is the authoritative reference for what belongs in core vs. what gets pushe
 
 ## One-sentence Mission
 
-> **DeepSeek-V4-Flash 专用**、极致高内聚的 Token Factory。性能（相对同配置 SGLang）优先于通用性；一切与 V4-Flash 热路径无关的模型面与协议面默认不做。
+> **Qwen3.8-Flash-Next NVFP4 专用、GPU-only** Token Factory。性能（相对同配置 SGLang）优先于通用性；其它模型面与宽协议面默认不做。
 
-**权威专用路线**：[v4-flash-only.md](./v4-flash-only.md)（2026-08-08 采纳）。
+**权威专用路线**：[qwen38-flash-next-only.md](./qwen38-flash-next-only.md)（2026-10-03 用户确认）。
 
-**唯一一等公民模型**：DeepSeek-V4-Flash（含 0731 权重形态）。  
-其它 MoE（Mixtral / Qwen-MoE / MiniMax 等）与 Qwen thruput/FORCE_HF 栈降为 **legacy**（可删、不进默认门禁、不占用 P0）。  
+**唯一一等公民模型**：Qwen3.8-Flash-Next，RadixArk NVFP4。独立文本原型尚未验收。
+V4 及其它 MoE 为 **legacy**；保留现有代码和历史记录，不占用 P0，不批量删除用户工作。
 Dense 端侧模型 **不在本产品线**。
 
 执行原则：
 
-1. **焊死 V4-Flash**：load 拒绝非 V4 配置；热路径只有 `v4_runner`（目标态）。  
+1. **专用 Qwen3.8 图**：正确实现 GDN/QSA/PLE/hyperconnection/NVFP4；不新增通用 registry。当前入口仍为 V4，验收新 runner 后再迁移默认。
 2. **搬代码不引大包**：从 vLLM / SGLang / 官方 `inference/` **vendor 进仓**（改 import），禁止 runtime `import sglang` / `import vllm`。  
-3. **KPI**：同机同权重 vs SGLang 的 warm decode tok/s（及约定 TTFT），见 v4-flash-only §5。  
-4. 调度 + Radix 双池仍自持；OpenAI 面仍在 Rust `control/`，业务上移 UniGateway。
+3. **KPI**：8×5090 同机同权重、同 GPU 预算 vs 标准 SGLang 的 warm tok/s；用户允许不同并行结构，两边均需调优并披露 TP/EP/DP/PP。区分端到端生成与纯 decode 时长。
+4. GPU 驻留的 QSA KV/GDN 状态/PLE 历史及调度自持；OpenAI 面仍在 Rust `control/`，业务上移 UniGateway。禁止 CPU/SSD offload 和 unified-memory 回退。
 
-**Execution status**（V4 专用后）:
+**Execution status**（迁移中）:
 
 | 路径 | 当前阶段 | KV / prefix | Decode 内核 | 备注 |
 |------|----------|-------------|-------------|------|
-| **DeepSeek-V4-Flash** | Hybrid 已落地；转向 **专用 runner + vendor 核** | dual-pool；Owned 页为源 | 官方 sparse / vendor SGLang·vLLM 子集；满图 | **唯一 P0** |
+| **Qwen3.8-Flash-Next NVFP4** | 基线完成；独立单序列原型待完整数值验收 | 首轮持久张量 GPU 审计通过，恢复/复用待接入 | 叶子核测试通过，graph 捕获/释放跑通 | **唯一 P0，不可宣称已支持** |
+| **DeepSeek-V4-Flash** | 现有默认入口保留 | dual-pool；Owned 页为源 | 官方 sparse / vendor 子集 | 历史/兼容 |
 | legacy 多 MoE | 冻结 | 历史 Radix paged | HF/FI | 不优化、不门禁 |
 
 The `engine/` core is a **pure library** exposing three further-decomposed building blocks (RadixKVCache, BatchingScheduler, MoEModelRunner). The sglang-lite product also ships a thin standalone control/serving shell so it can serve users without SGLang, vLLM, or UniGateway.
@@ -63,10 +64,10 @@ The `engine/` core is a **pure library** exposing three further-decomposed build
 | **Scheduling**                 | MoE-aware batch formation               | **重构** (partial) | BatchFormer runs inside the engine; an optional gateway may pass only stable high-level hints. | - | P1       |
 | **Execution**                  | MoEModelRunner (composed: Router + Prefill/Decode Executors + KernelBackend) | **重构** | Routing + execution for MoE. Composed internally so pieces can be swapped. | - | P0       |
 | **Execution**                  | CUDA graph (conservative for MoE)       | **重构** (optional) | Big win when possible; unigateway can choose execution strategy. | - | P0       |
-| **Model Support**              | **DeepSeek-V4-Flash only**（默认 `SGLANG_LITE_V4_ONLY=1`） | **重构** | 焊死产品；vendor 官方/SGLang/vLLM 子集；非 V4 load 拒绝 | `SGLANG_LITE_V4_ONLY=0` 仅 legacy 实验 | P0       |
+| **Model Support**              | **Qwen3.8-Flash-Next NVFP4 only**（目标态，尚未实现） | **重构** | 专用图 + GPU-only；vendor 必要叶子实现 | 正确性与性能验收后迁移 V4 默认入口 | P0       |
 | **Model Support**              | legacy multi-MoE (Qwen/Mixtral/MiniMax) | legacy | 不进默认门禁、不优化 | 可删 / 移出默认构建 | -        |
 | **Model Support**              | Tokenizer (HF)                          | 直接引用      | Mature, no point reimplementing.                                                                  | -                                        | P0       |
-| **Model Support**              | New MoE model quick add                 | **重构**      | Registry + loader hook only. Support for common MoE patterns.                                     | Simple config + extension point          | P1       |
+| **Model Support**              | New MoE model quick add                 | **不做**      | 禁止通用模型 registry 扩展 | 仅目标检查点 | - |
 | **Observability**              | Prometheus (t/s, cache_hit, batch, q)   | **重构**      | Only the metrics that matter for this lite scope.                                                 | -                                        | P0       |
 | **Observability**              | Structured logs + request id            | **重构**      | Correlate across unigateway / engine.                                                             | -                                        | P0       |
 | **Observability**              | Graceful shutdown + health              | **重构**      | 3am stability.                                                                                        | -                                        | P0       |

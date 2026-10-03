@@ -1,5 +1,9 @@
 # sglang-lite Optimization Priorities (2026-07-06)
 
+> 当前主目标已切换为 Qwen3.8-Flash-Next GPU-only。最新实测与优化记录见
+> [qwen38-optimization-log.md](qwen38-optimization-log.md)；下文保留为历史规划，
+> 不代表当前实现状态或 P0 取舍。
+
 This document records the current optimization summary. The authoritative plan for turning
 sglang-lite into an independent streaming inference service is
 [`standalone-inference-service-roadmap.md`](./standalone-inference-service-roadmap.md).

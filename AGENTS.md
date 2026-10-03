@@ -6,22 +6,23 @@
 
 ## 核心理念（不可违背）
 
-sglang-lite 是 **DeepSeek-V4-Flash 专用**、极致高内聚的 Token Factory（性能优先于通用性）。
+sglang-lite 是 **Qwen3.8-Flash-Next 专用**、极致高内聚的 Token Factory（性能优先于通用性）。
 
-- **唯一一等公民模型**：DeepSeek-V4-Flash。其它模型面为 legacy，不进 P0。
+- **唯一一等公民模型**：Qwen3.8-Flash-Next，当前目标权重为 RadixArk NVFP4。V4 和其它模型面为 legacy，不进 P0。
 - 最核心且必须深度耦合的三个组件：
-  1. KVCacheManager（V4 双池 Radix / page 为源）
-  2. Scheduler（continuous batching；可按 V4 批形态简化）
-  3. **V4 ModelRunner**（CUDA graph 满图 decode；从 vLLM/SGLang/**官方 inference 搬代码**进 `vendor/`，禁止 runtime `import sglang` / `import vllm`）
+  1. KVCacheManager（QSA KV + GDN 状态 + PLE 历史，明确生命周期与 GPU 驻留）
+  2. Scheduler（continuous batching；可按 Qwen3.8 批形态简化）
+  3. **Qwen3.8 ModelRunner**（目标：CUDA graph decode；vendor 必要叶子实现，禁止 runtime `import sglang` / `import vllm`）
+- 模型计算、专家、PLE 表及推理状态必须留在 GPU；禁止 CPU/SSD offload、unified-memory 回退。CPU tokenizer、加载和控制逻辑不在此限制内。
 - **Rust 层是对外的控制点**（OpenAI 协议适配层）。所有请求验证、早期拒绝、streaming 控制、错误处理都必须在这里完成。
 - 一切业务逻辑与高级网关能力 **必须上移** UniGateway。`engine/` 保持引擎库。
 - KPI：**同机同权重相对 SGLang 的 warm tok/s**，不是「支持多少模型」。
-- 遇到不确定时，**优先缩小 scope**；为 V4 性能可牺牲抽象与通用性。
+- 遇到不确定时，**优先缩小 scope**；为 Qwen3.8 性能可牺牲抽象与通用性。
 
 变更前必须阅读的文档：
-- [docs/v4-flash-only.md](docs/v4-flash-only.md) —— **V4 专用产品宪章（已采纳）**
+- [docs/qwen38-flash-next-only.md](docs/qwen38-flash-next-only.md) —— **当前产品宪章（已采纳）**
 - [docs/scope.md](docs/scope.md) —— Feature 取舍表
-- [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) —— V4 技术细节
+- [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) —— 历史 V4 技术细节（仅修改 V4 路径时必读）
 - [docs/architecture.md](docs/architecture.md) —— 分层边界
 
 ## 严格禁止或需特别审查的变更
@@ -126,30 +127,31 @@ sglang-lite 强调高内聚与整洁，**根目录严禁堆放非核心内容**�
 
 ## 模型支持策略
 
-**只支持 DeepSeek-V4-Flash**（见 [docs/v4-flash-only.md](docs/v4-flash-only.md)）。
+**只将 Qwen3.8-Flash-Next 作为主目标**（见 [docs/qwen38-flash-next-only.md](docs/qwen38-flash-next-only.md)）。
 
-- 禁止再扩展 Qwen-MoE / Mixtral / MiniMax 等通用热路径。
-- 允许 **vendor** 上游（vLLM / SGLang / 官方 inference）中与 V4 相关的代码与核，保留许可证头。
+- 禁止扩展其它 Qwen 家族 / Mixtral / MiniMax 等通用热路径。
+- 允许 **vendor** 上游（vLLM / SGLang / 官方 inference / Strata）中与目标图相关的叶子代码与核，保留许可证头并钉来源 commit。
+- Strata 仅作为 GPU 算子参考；不引入其 CPU 专家、SSD 分层或推测执行架构。
 - 禁止为「多模型 registry」增加抽象。
 
 ## 推荐工作流程
 
-1. 先阅读 **v4-flash-only.md** + scope.md  
-2. 变更是否服务 **V4 性能 KPI**？否则默认不做  
-3. 搬代码 → `vendor/` + SOURCES 钉 commit；热路径进 `v4_runner`  
-4. 小步提交；PRO6000 对照 SGLang thruput  
+1. 先阅读 **qwen38-flash-next-only.md** + scope.md
+2. 变更是否服务 **Qwen3.8 GPU-only 性能 KPI**？否则默认不做
+3. 建立正确基线 → 搬必要叶子实现到 `vendor/` + SOURCES 钉 commit → 独立 runner
+4. 小步验证；8×5090 上同机同权重对照 SGLang，先正确性后吞吐
 
 ## 当前阶段
 
-**产品赌注已切换为 V4-Flash 专用**（2026-08-08）。
+**产品赌注经用户确认切换为 Qwen3.8-Flash-Next NVFP4、GPU-only**（2026-10-03）。
 
-- 文档：`docs/v4-flash-only.md` 为宪章；通用 MoE thruput（Qwen FORCE_HF 等）**退出 P0**。  
-- 代码现状：`SGLANG_LITE_V4_ONLY=1`；**live vendor** `engine/vendor/deepseek_infer/`（官方 model/kernel/encoding，HF pin `60d8d707`）；`v4_runner` 负责 load/forward/encode/accel。SGLang V4 切片在 `vendor/sglang_v4/reference`（不 import sglang）。  
-- 下一刀（权重机）：`bash scripts/v4_vs_sglang_bench.sh` 验收 warm tok/s > SGLang；Phase V2 移植 dsv4 叶子核 + 跨 start_pos 满图。  
-- 技术细节与 SM120 路由仍见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md)。  
-- 运维入口见 [docs/runbook.md](docs/runbook.md)（将逐步改为 V4 对照命令）。
-
-阶段定义与验收见 [docs/deepseek-v4-flash-plan.md](docs/deepseek-v4-flash-plan.md) **§8**。
+- 新宪章：`docs/qwen38-flash-next-only.md`。旧 V4 宪章与测量记录保留为历史资料。
+- 代码现状仍默认 `SGLANG_LITE_V4_ONLY=1`；Qwen3.8 独立文本原型位于 `engine/qwen38_runner/`，完整数值/吞吐/服务验收未完成，不得仅关闭 gate 就声称支持。
+- 标准 SGLang 基线已测量，256-token warm 为 114.45 tok/s；`scripts/qwen38_sglang_baseline.py` 是外部对照，不是 lite 实现。
+- 优化过程、原始时长、失败实验与验收限制见 `docs/qwen38-optimization-log.md`。
+- 先验证 GDN / QSA / PLE / hyperconnection / NVFP4 的完整图与 GPU 驻留，再迁移默认入口。
+- 保留现有 V4 路径和未提交工作，不在产品切换时批量删除。
+- 运维与历史命令见 [docs/runbook.md](docs/runbook.md)。
 
 欢迎贡献，但请严格遵守高内聚与 scope 纪律。
 

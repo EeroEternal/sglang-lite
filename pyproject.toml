@@ -39,10 +39,13 @@ sgl-kernel = ["sgl-kernel>=0.4.4"]
 # DeepSeek-V4 Hybrid: official inference/ + convert shards (see scripts/v4_official_smoke.sh)
 # fast-hadamard-transform: build from source with system CUDA + TORCH_CUDA_ARCH_LIST=12.0
 deepseek-v4 = ["safetensors>=0.4", "tilelang>=0.1.8", "fast-hadamard-transform>=1.0"]
+# Qwen3.8 prototype leaf dependencies; validated with Torch 2.13.0+cu130 on SM120.
+qwen38 = ["safetensors>=0.4", "flashinfer-python==0.6.18", "tokenizers>=0.20"]
 
 [tool.setuptools]
-packages = ["sglang_lite"]
+packages = ["sglang_lite", "sglang_lite.qwen38_runner"]
 package-dir = { "sglang_lite" = "engine" }
+license-files = ["docs/vendor/QWEN38_APACHE_LICENSE"]
 
 [tool.ruff]
 line-length = 100

@@ -16,7 +16,7 @@ from .cuda_graph import (
     maybe_compile_model,
 )
 from .kernel_backend import PagedAttnContext, create_kernel_backend
-from .kv_cache import PastKV, RadixCache
+from .kv_cache import PastKV, RadixCache, cache_is_hybrid
 from .models import assert_moe_supported, is_fixture_model, register_verified
 from .moe_hooks import maybe_attach_fused_moe
 from .native_decode import native_decode_enabled, try_build_paged_native
@@ -220,7 +220,18 @@ class ModelRunner:
         fi_gqa_ok = gqa_group in (1, 2, 4, 8, 16, 32, 64)
         mt_lower = (model_type or "").lower()
         is_minimax = mt_lower.startswith("minimax") or fam.name == "minimax_moe"
-        skip_paged = is_mla or is_minimax or not fi_gqa_ok
+        text_cfg = cfg_obj
+        getter = getattr(cfg_obj, "get_text_config", None)
+        if callable(getter):
+            try:
+                text_cfg = getter(decoder=True)
+            except Exception:
+                text_cfg = cfg_obj
+        layer_types = list(getattr(text_cfg, "layer_types", None) or [])
+        is_hybrid_linear = any(
+            t in ("linear_attention", "mamba", "conv") for t in layer_types
+        )
+        skip_paged = is_mla or is_minimax or not fi_gqa_ok or is_hybrid_linear
         print(f"[sglang-lite] Kernel backend: {self.kernel_backend.name}")
         import os as _os
 
@@ -261,12 +272,16 @@ class ModelRunner:
         elif skip_paged:
             self.use_paged_as_source = False
             reason = (
-                "MLA"
-                if is_mla
+                "hybrid linear attention"
+                if is_hybrid_linear
                 else (
-                    "MiniMax/custom"
-                    if is_minimax
-                    else f"GQA group_size={gqa_group} unsupported by FI paged"
+                    "MLA"
+                    if is_mla
+                    else (
+                        "MiniMax/custom"
+                        if is_minimax
+                        else f"GQA group_size={gqa_group} unsupported by FI paged"
+                    )
                 )
             )
             print(
@@ -1913,8 +1928,15 @@ class ModelRunner:
         self._logits_to_keep_ok = ok
         return ok
 
+    def _cache_is_hybrid(self, past) -> bool:
+        return cache_is_hybrid(past)
+
     def _past_for_seq(self, seq: Sequence, radix: RadixCache):
         """CPU/stub path: rebuild HF cache from paged KV when enabled."""
+        # Paged pages only store full-attention K/V. A live hybrid cache is the
+        # source of truth for Gated DeltaNet conv/recurrent state.
+        if self._cache_is_hybrid(getattr(seq, "kv_state", None)):
+            return seq.kv_state
         if self.use_paged_as_source and seq.block_table and seq.cached_len > 0:
             self.paged_rebuild_count += 1
             return radix.build_cache(seq.block_table, seq.cached_len)
@@ -1936,6 +1958,12 @@ class ModelRunner:
         """Stack per-seq caches into one batched DynamicCache/legacy list."""
         if not pasts or all(p is None for p in pasts):
             return None
+        if any(self._cache_is_hybrid(p) for p in pasts):
+            if len(pasts) != 1:
+                raise RuntimeError(
+                    "hybrid linear-attention cache supports one sequence per forward"
+                )
+            return pasts[0]
         legacies = []
         for p in pasts:
             if p is None:
@@ -1954,6 +1982,12 @@ class ModelRunner:
         return self._as_model_cache(batched)
 
     def _split_batch_cache(self, past, index: int, batch_size: int):
+        if self._cache_is_hybrid(past):
+            if batch_size != 1:
+                raise RuntimeError(
+                    "hybrid linear-attention cache supports one sequence per forward"
+                )
+            return past
         legacy = self._to_legacy_kv(past)
         if legacy is None:
             return None
@@ -2058,6 +2092,9 @@ class ModelRunner:
                 return past
         # Existing Cache / DynamicCache: pass through. Never materialize all layers
         # to legacy just to check dtypes — that was a multi-ms/step tax on decode.
+        # Hybrid linear-attention caches must not be rebuilt from (K, V) either.
+        if self._cache_is_hybrid(past):
+            return past
         if hasattr(past, "get_seq_length") or hasattr(past, "layers"):
             return past
         return past

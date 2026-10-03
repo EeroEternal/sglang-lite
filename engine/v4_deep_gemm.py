@@ -218,6 +218,71 @@ def fp4_gemm_nt(
     return out
 
 
+def grouped_mk_alignment() -> int:
+    """Row alignment of ``m_grouped_fp8_fp4_gemm_nt_contiguous`` (SM120: 128)."""
+    dg = _import_deep_gemm_sm120()
+    if dg is None or not hasattr(dg, "get_mk_alignment_for_contiguous_layout"):
+        raise RuntimeError("deep_gemm_sm120 grouped GEMM unavailable")
+    return int(dg.get_mk_alignment_for_contiguous_layout())
+
+
+def grouped_fp4_gemm_nt(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    grouped_layout: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Grouped ``A[M,K] @ B[G,N,K]^T``.
+
+    ``grouped_layout`` is int32 ``[M]``. Each aligned block of
+    ``grouped_mk_alignment()`` rows belongs to one group; the value at the
+    first row of the block is the index into ``B``. ``-1`` skips that block.
+
+    Pass ``recipe_a`` / ``recipe_b`` only. This entry rejects a combined
+    ``recipe`` together with the split recipes (the dense GEMM accepts both).
+    Output is always bfloat16. The grouped kernel rejects fp32.
+    """
+    dg = _import_deep_gemm_sm120()
+    if dg is None or not hasattr(dg, "m_grouped_fp8_fp4_gemm_nt_contiguous"):
+        raise RuntimeError("deep_gemm_sm120 grouped GEMM unavailable")
+
+    # Grouped SM120 entry asserts D is bf16 (dense fp8_fp4_gemm_nt also
+    # accepts fp32). The V4 loader sets the default dtype to bf16 before
+    # forward, which is the contract this matches.
+    odt = torch.bfloat16
+    if out_dtype is not None and out_dtype != torch.bfloat16:
+        raise RuntimeError("grouped FP4 GEMM output must be bfloat16")
+    m, k = a.shape
+    _g, n, _kp = b.shape
+    if out is None:
+        out = torch.empty(m, n, device=a.device, dtype=odt)
+    a2 = a if a.is_contiguous() else a.contiguous()
+    as2 = scale_to_f32(a_s)
+    as2 = as2 if as2.is_contiguous() else as2.contiguous()
+    b2 = b if b.is_contiguous() else b.contiguous()
+    bs2 = scale_to_f32(b_s)
+    bs2 = bs2 if bs2.is_contiguous() else bs2.contiguous()
+    d2 = out if out.is_contiguous() and out.dtype == odt else torch.empty(m, n, device=a.device, dtype=odt)
+    layout = grouped_layout
+    if layout.dtype != torch.int32 or not layout.is_contiguous():
+        layout = layout.to(dtype=torch.int32).contiguous()
+    dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        (a2, as2),
+        (b2, bs2),
+        d2,
+        layout,
+        recipe_a=_RECIPE_A,
+        recipe_b=_RECIPE_B,
+    )
+    if d2 is not out:
+        out.copy_(d2)
+    return out
+
+
 def _fp4_gemm_dropin(
     a: torch.Tensor,
     a_s: torch.Tensor,
@@ -355,6 +420,8 @@ __all__ = [
     "attach_v4_deep_gemm",
     "deep_gemm_enabled",
     "fp4_gemm_nt",
+    "grouped_fp4_gemm_nt",
+    "grouped_mk_alignment",
     "is_armed",
     "probe_deep_gemm_sm120",
     "prewarm_model_scales",

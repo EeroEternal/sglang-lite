@@ -56,6 +56,8 @@ def _build_tiny_mixtral(path: Path) -> None:
         from transformers import GPT2TokenizerFast
 
         tok = GPT2TokenizerFast.from_pretrained("gpt2", local_files_only=True)
+        if not tok.encode("hello world"):
+            raise ValueError("cached GPT2 tokenizer produced no fixture tokens")
     except Exception:
         tok = _build_offline_tokenizer(path)
 

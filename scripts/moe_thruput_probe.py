@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -59,8 +60,11 @@ def main() -> int:
         help="comma list of batchxmax_new (batch>1 runs sequential for now)",
     )
     ap.add_argument("--max-batch", type=int, default=8)
+    ap.add_argument("--warm-runs", type=int, default=1)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+    if args.warm_runs < 1:
+        ap.error("--warm-runs must be positive")
 
     _ensure_path()
     os.environ.setdefault("SGLANG_LITE_V4_DISABLE_FI_SPARSE", "1")
@@ -125,22 +129,32 @@ def main() -> int:
                 usage = out.get("usage") or {}
                 cold_tok += int(usage.get("completion_tokens") or 0)
                 if i == 0:
-                    sample = (out.get("text") or "")[:160]
+                    sample = eng.detokenize(out.get("output_ids") or [])[:160]
                 if out.get("error"):
                     raise RuntimeError(out["error"])
-            for i in range(batch):
-                t0 = time.perf_counter()
-                out = eng.generate(
-                    f"thru-warm-{case['batch']}x{max_new}-{i}",
-                    ids,
-                    max_tokens=max_new,
-                    temperature=0.0,
-                )
-                warm_s += time.perf_counter() - t0
-                usage = out.get("usage") or {}
-                warm_tok += int(usage.get("completion_tokens") or 0)
-                if out.get("error"):
-                    raise RuntimeError(out["error"])
+            warm_runs = []
+            warm_text = ""
+            for run in range(args.warm_runs):
+                run_s = 0.0
+                run_tok = 0
+                for i in range(batch):
+                    t0 = time.perf_counter()
+                    out = eng.generate(
+                        f"thru-warm-{case['batch']}x{max_new}-{run}-{i}",
+                        ids,
+                        max_tokens=max_new,
+                        temperature=0.0,
+                    )
+                    run_s += time.perf_counter() - t0
+                    usage = out.get("usage") or {}
+                    run_tok += int(usage.get("completion_tokens") or 0)
+                    if out.get("error"):
+                        raise RuntimeError(out["error"])
+                    if i == 0:
+                        warm_text = eng.detokenize(out.get("output_ids") or [])[:160]
+                warm_runs.append({"seconds": run_s, "tokens": run_tok})
+            warm_s = statistics.median(r["seconds"] for r in warm_runs)
+            warm_tok = warm_runs[0]["tokens"]
             row = {
                 "case": f"{batch}x{max_new}",
                 "batch": batch,
@@ -153,6 +167,8 @@ def main() -> int:
                 "tok_s_cold": round(cold_tok / cold_s, 2) if cold_s > 0 else 0.0,
                 "tok_s_warm": round(warm_tok / warm_s, 2) if warm_s > 0 else 0.0,
                 "sample_text": sample,
+                "warm_sample_text": warm_text,
+                "warm_runs": warm_runs,
             }
             results.append(row)
             print(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import time
 import traceback
 from pathlib import Path
@@ -21,7 +22,10 @@ def main() -> int:
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--mem-fraction", type=float, default=0.85)
+    ap.add_argument("--warm-runs", type=int, default=1)
     args = ap.parse_args()
+    if args.warm_runs < 1:
+        ap.error("--warm-runs must be positive")
 
     payload = {
         "engine": "sglang",
@@ -53,12 +57,15 @@ def main() -> int:
                 {"max_new_tokens": n, "temperature": 0, "ignore_eos": True},
             )
             cold_s = time.perf_counter() - t1
-            t2 = time.perf_counter()
-            o2 = engine.generate(
-                args.prompt,
-                {"max_new_tokens": n, "temperature": 0, "ignore_eos": True},
-            )
-            warm_s = time.perf_counter() - t2
+            warm_runs = []
+            for _ in range(args.warm_runs):
+                t2 = time.perf_counter()
+                o2 = engine.generate(
+                    args.prompt,
+                    {"max_new_tokens": n, "temperature": 0, "ignore_eos": True},
+                )
+                warm_runs.append(time.perf_counter() - t2)
+            warm_s = statistics.median(warm_runs)
 
             def ntok(o, fallback: int) -> int:
                 if isinstance(o, dict):
@@ -86,6 +93,10 @@ def main() -> int:
                 "sample_text": str(
                     (o1.get("text") if isinstance(o1, dict) else o1) or ""
                 )[:120],
+                "warm_sample_text": str(
+                    (o2.get("text") if isinstance(o2, dict) else o2) or ""
+                )[:160],
+                "warm_runs_s": warm_runs,
             }
             payload["cases"].append(row)
             print("[sglang]", row)

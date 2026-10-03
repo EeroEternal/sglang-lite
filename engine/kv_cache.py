@@ -128,6 +128,23 @@ class RadixTree:
         return None
 
 
+def cache_is_hybrid(past) -> bool:
+    """True when the HF cache holds linear-attention state, not only K/V.
+
+    Qwen3.5/3.6 Gated DeltaNet layers keep conv and recurrent state on
+    ``LinearAttentionLayer``. Flattening those layers to ``(K, V)`` drops the
+    state and the next forward rejects the cache.
+    """
+    layers = getattr(past, "layers", None)
+    if not layers:
+        return False
+    try:
+        from transformers.cache_utils import LinearAttentionCacheLayerMixin
+    except Exception:
+        return False
+    return any(isinstance(layer, LinearAttentionCacheLayerMixin) for layer in layers)
+
+
 class RadixCache:
     """Paged KV + radix prefix index with refcounted blocks and COW forks."""
 
@@ -641,6 +658,11 @@ class RadixCache:
     def fork_kv(self, src_kv: Optional[PastKV]) -> Optional[PastKV]:
         if src_kv is None:
             return None
+        # Hybrid caches are not a list of (K, V). to_legacy_cache drops GDN state.
+        if cache_is_hybrid(src_kv):
+            import copy
+
+            return copy.deepcopy(src_kv)  # type: ignore[return-value]
         # HF DynamicCache / Cache objects
         if hasattr(src_kv, "to_legacy_cache"):
             try:

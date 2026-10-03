@@ -1,20 +1,27 @@
 # sglang-lite
 
-**DeepSeek-V4-Flash 专用**、极致高内聚的 Token Factory（性能优先于通用性）。
+**Qwen3.8-Flash-Next NVFP4、GPU-only** Token Factory（性能优先于通用性）。
 
-- 自持 Radix / dual-pool KV + continuous batching
-- **Vendor** 官方 inference 图（不 `import sglang` / `import vllm`）
-- CUDA graph 友好 decode 热路径（`engine/v4_runner`）
+**迁移中**：2026-10-03 经用户确认切换主目标。Qwen3.8 独立文本原型尚未验收，
+真实吞吐尚未验收；当前默认入口仍是保留的 V4 路径，不能直接加载新模型。
+
+- 自持 QSA KV / GDN 状态 / PLE 历史与 continuous batching（目标态）
+- **Vendor** 必要叶子实现（引擎不 `import sglang` / `import vllm`）
+- GPU-only decode 与 CUDA graph 优化（待真实模型验证）
 - 薄 Rust OpenAI 控制面
 
 > "The engine is only responsible for reliably and efficiently producing tokens." — 业务与宽协议上移 UniGateway。
 
-**产品宪章**：[docs/v4-flash-only.md](docs/v4-flash-only.md)
+**产品宪章**：[docs/qwen38-flash-next-only.md](docs/qwen38-flash-next-only.md)
+**优化实录**：[docs/qwen38-optimization-log.md](docs/qwen38-optimization-log.md)，含原始时长、失败实验和未通过的验收项。
 
 ## Mission
 
-只服务 **DeepSeek-V4-Flash**（含 0731 权重形态）。KPI：同机同权重 warm decode tok/s **超过 SGLang**。  
-其它 MoE 为 legacy（`SGLANG_LITE_V4_ONLY=0`）。Dense / 多模态 / 投机 / PD disagg **不做**。
+主目标只服务 **Qwen3.8-Flash-Next，RadixArk NVFP4**。KPI：8×5090 同机同权重、
+同 GPU 预算、两边分别调优后的 warm tok/s **超过标准 SGLang**，先验收正确性及 GPU 驻留。
+允许不同 GPU 并行结构，但必须披露 TP/EP/DP/PP，并保留同配置受控对照。
+禁止 CPU/SSD offload 或 unified-memory 回退。V4 和其它 MoE 为历史/兼容路径；
+Dense / 多模态 / 投机 / PD disagg **不做**。文档中的原有模型示例和数字不代表 Qwen3.8 验收结果。
 
 ## Why sglang-lite?
 
@@ -35,7 +42,9 @@ The goal is to achieve stable 80%+ of theoretical throughput in target scenarios
 
 References: nano-vLLM (~1.2k LOC teaching version), mini-sglang.
 
-**Scope note**: After re-evaluation, sglang-lite supports **only popular MoE models** (DeepSeek, Qwen-MoE, Mixtral-style, etc.). Dense models are explicitly out of scope. MoE routing and batching are first-class considerations, while keeping the overall design lightweight.
+**Scope note**: The primary target is Qwen3.8-Flash-Next NVFP4 only, not a general
+MoE registry. The dedicated runner is under preparation. Dense models and other
+model-family optimizations are outside the current scope.
 
 ## vLLM Positioning Compatibility
 

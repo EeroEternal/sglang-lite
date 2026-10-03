@@ -1,5 +1,18 @@
 # sglang-lite Architecture
 
+## 当前主目标与迁移状态
+
+2026-10-03 经用户确认，主目标切换为 **Qwen3.8-Flash-Next RadixArk NVFP4，
+GPU-only**，见 [产品宪章](./qwen38-flash-next-only.md)。现有 V4 路径保留；
+Qwen3.8 的独立单序列文本原型位于 `engine/qwen38_runner/`，尚未通过真实
+正确性/驻留/吞吐验收，也未接入调度器；以下引擎/控制面边界不变。
+
+新执行核心需要自持 QSA KV、GDN 状态和 PLE 历史的联合生命周期，并正确处理
+FP8 PLE scale、hyperconnection、NVFP4 expert 分片。模型算子和持久状态留在 GPU，
+禁止 CPU/SSD offload 或 unified-memory 回退。CPU tokenizer、加载与控制逻辑允许。
+SGLang 只可用于 `scripts/` 的外部基线；独立 lite runner 不导入 SGLang/vLLM。
+默认入口需待真实正确性与同机吞吐验收后迁移，不能仅禁用 V4 gate。
+
 ## Guiding Principle: High Cohesion + Composability
 
 The `engine/` core remains a **pure library**, while sglang-lite as a product is an
