@@ -286,3 +286,89 @@ Artifact：`qwen38-owned-speed-weight-cache.json` 与同上下文 `.trace.json`�
 **结论：小幅变快，仍慢于既有标准 SGLang，未通过主 KPI 或完整数值门禁。**
 后续速度工作应集中在已测的 HC/GDN GEMV、小算子 launch、专家执行与
 98 次/token reduction，不再把 host 同步或完整 logits 当成唯一原因。
+
+## 7. 有长度上界的短上下文 QSA 剪枝（2026-10-03）
+
+上一轮已推送为 `8a023b2`。本轮仍仅处理速度，不新增模型、服务或采样功能。
+
+先尝试合并 GDN 的 QKV/Z/B/A 投影，从四次 GEMV 改为一次
+M=1、N=2060、K=2560 的 BF16 投影。严格 GPU 叶子对照发现 Z 的
+768 项中一项不一致，最大绝对差 0.0625；因此撤回打包实现，
+没有放宽断言、保留失败代码或把未通过数值检查的时长记作收益。
+
+改为消除短上下文不会使用的 QSA 工作：
+
+- 原 attention 在 position<2048 时读取所有已有 KV，不使用 indexer
+  的 selected slots；但之前每个 QSA 层仍执行 IQ norm/RoPE、压缩键
+  score GEMV、ReLU/reduction、mask、top-k 和 selected-slot 构建。
+- runner 可接收显式 `execution_limit`。只有该上界≤2048 时，跳过
+  上述评分/选择，给 attention 一个 GPU dummy slot，并专门化 dense 分支。
+  未提供上界或上界>2048 时保持原有动态 dense/sparse 路径。
+- **不缩小 KV capacity，也不删除索引状态。** index-QK 投影、raw index
+  更新、每四 token 的压缩/归一化/RoPE 与 compressed 写入完全保留；
+  不切割投影维度，以免再次改变 GEMV 的 BF16 舍入。
+- dense kernel 显式检查 `0≤position<execution_limit`，强制启用 Triton
+  device assertion。超过声明上界会失败，不静默继续使用错误的 dense 图。
+  非整数、非正数或超出 capacity 的上界在加载前拒绝。
+- benchmark 从 prompt、最大输出数、warmup/capture 和四次 profile
+  replay 计算安全上界，本轮为 271；容量仍为 4096。正确性探针同样
+  从自身完整执行范围推导上界。`--full-qsa-selection` 只作为 benchmark
+  的原路径对照，不是 serving 功能开关。
+
+新增 GPU 回归覆盖：dense 专门化与原 kernel 的逐位输出一致、
+完整 QSA 八步输出及 keys/values/index_raw/compressed 状态完全一致、
+2048 以上上界走原路径，以及非法上界的加载前拒绝。
+另外在独立子进程测试 GPU 越界 assertion，避免负例污染主测试 CUDA context。
+
+### 7.1 真实权重 A/B 结果
+
+保持 TP8/EP8、attention DP1/PP1、相同 checkpoint、4096 KV capacity、
+11-token prompt 和三次 warm。两个 profile 均从 position 266 开始。
+Artifact：`qwen38-owned-speed-bounded-qsa.json`、
+`qwen38-owned-speed-full-qsa-control.json` 及各自 `.trace.json`。
+
+| 输出数 | 有界 QSA runner warm 秒 | 中位 tok/s | 相对上一轮 8a023b2 | decode warm 秒（N-1 次） | decode tok/s |
+|---|---|---:|---:|---|---:|
+| 64 | 0.7888706 / 0.7877996 / 0.7884440 | 81.17 | +8.08% | 0.6717875 / 0.6715131 / 0.6720558 | 93.78 |
+| 128 | 1.4739556 / 1.4737807 / 1.4739572 | 86.84 | +8.11% | 1.3571497 / 1.3572131 / 1.3575284 | 93.57 |
+| 256 | 2.8617650 / 2.8615802 / 2.8615952 | 89.46 | +8.16% | 2.7447957 / 2.7449451 / 2.7448940 | 92.90 |
+
+同期 `--full-qsa-selection` 原路径对照：
+
+| 输出数 | runner warm 秒 | 中位 tok/s | decode warm 秒（N-1 次） | decode tok/s |
+|---|---|---:|---|---:|
+| 64 | 0.8522895 / 0.8522907 / 0.8519205 | 75.09 | 0.7263524 / 0.7263553 / 0.7261352 | 86.73 |
+| 128 | 1.6462050 / 1.6464677 / 1.5953206 | 77.75 | 1.5158798 / 1.5160681 / 1.4678901 | 83.78 |
+| 256 | 3.0951939 / 3.0949350 / 3.0948220 | 82.72 | 2.9689194 / 2.9688989 / 2.9686184 | 85.89 |
+
+128-token 对照存在时长波动，其中一次恢复上一轮约 1.59 秒的水平；
+不隐去原始样本或把中位数变化全归因到改动。
+64/256-token 对照与上一轮基本一致。全部 warm 重复 ID 一致，两个
+新路径的 64/128/256 序列都与上一轮对应序列逐 ID 完全一致；
+prompt、config/index hash、并行结构和容量也已核对一致。
+
+四次 replay 的 rank0 kernel 数 **18,248→16,040（-12.10%）**，
+kernel 时间合计 **45.731→42.158 ms（-7.81%）**。
+top-k kernel 次数 **240→192**，保留 48 MoE 层每步的 routing top-k，
+仅消除 12 QSA 层每步不会被 dense attention 使用的选择。
+kernel 合计仍不是请求 wall time。
+
+### 7.2 数值、驻留与限制
+
+`qwen38-owned-teacher-64-bounded-qsa.json` 对照
+`qwen38-owned-teacher-64-weight-cache.json`：
+64-step top1 ID、每项 selected-token logprob 完全一致，最大变化 **0.0**。
+与确定性 SGLang 的既有差异不变：**63/64 top1、最大 logprob 误差
+0.2788197994**；此优化不代表完整正确性验收。
+八卡持久 tensor audit 全部 CUDA：rank0 为 1,663，其余各 1,471，
+相比上一轮各增加 12 个 dummy-selection GPU tensor；模型运行退出后
+八卡均回到 2 MiB，没有新增 CPU/SSD offload 或统一内存路径。
+
+最终聚焦回归 **29 项通过**（含 11 项 GPU 叶子与负例）；
+本地 18 项通过、11 项无 CUDA 跳过；Ruff lint/format 与 diff 检查通过。
+完整 Rust/仓库套件、跨 QSA budget 的真实长上下文、状态恢复/复用仍未验收。
+默认 serving gate 不变。新速度只适用于有正确执行上界的单序列路径，
+未经声明的 caller 默认保留原实现，不能把有界图拿去执行更长请求。
+
+**目前 runner 256-token 89.46 tok/s，仍低于既有 SGLang 请求端参考
+114.45 tok/s；计时范围不同，主 KPI 尚未达成。**

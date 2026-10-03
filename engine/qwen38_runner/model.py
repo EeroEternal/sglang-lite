@@ -93,7 +93,7 @@ class GDN:
 
 
 class QSA:
-    def __init__(self, weights, prefix, rank, world, capacity):
+    def __init__(self, weights, prefix, rank, world, capacity, execution_limit=None):
         self.heads = 24 // world
         self.q = weights.get(prefix + ".q_proj.weight", row_slice(12288, rank, world))
         kv_rank = rank // (world // 2)
@@ -113,6 +113,12 @@ class QSA:
         self.blocks = torch.arange(blocks, device=weights.device)
         self.compressed = torch.zeros((blocks, 128), device=weights.device, dtype=torch.bfloat16)
         self.capacity = capacity
+        self.dense_limit = execution_limit if execution_limit and execution_limit <= 2048 else 0
+        self.dense_selected = (
+            torch.full((1,), -1, device=weights.device, dtype=torch.int32)
+            if self.dense_limit
+            else None
+        )
 
     def reset(self):
         for state in (self.keys, self.values, self.index_raw, self.compressed):
@@ -126,7 +132,6 @@ class QSA:
         self.keys.index_copy_(0, position, k)
         self.values.index_copy_(0, position, F.linear(value, self.v))
         index_qk = F.linear(value, self.i_proj).reshape(5, 128)
-        iq = ops.rope(ops.rms(index_qk[:4], self.iqnorm), cos, sin)
         self.index_raw.index_copy_(0, position, index_qk[4:])
         block = position // 4
         slots = block * 4 + torch.arange(4, device=value.device)
@@ -145,14 +150,20 @@ class QSA:
         self.compressed.index_copy_(
             0, block, torch.where((position % 4 == 3).reshape(1, 1), compressed, old)
         )
-        scores = F.relu(iq.float() @ self.compressed.float().T).sum(0)
-        scores = scores.masked_fill(self.blocks >= (position + 1) // 4, -float("inf"))
-        chosen = torch.topk(scores, min(512, scores.numel())).indices
-        selected = (chosen[:, None] * 4 + torch.arange(4, device=value.device)).flatten()
-        pending = ((position + 1) // 4) * 4 + torch.arange(4, device=value.device)
-        selected = torch.cat([selected, pending])
-        selected = torch.where(selected <= position, selected, -1).int()
-        output = ops.attention(q, self.keys, self.values, position, selected)
+        if self.dense_limit:
+            selected = self.dense_selected
+        else:
+            iq = ops.rope(ops.rms(index_qk[:4], self.iqnorm), cos, sin)
+            scores = F.relu(iq.float() @ self.compressed.float().T).sum(0)
+            scores = scores.masked_fill(self.blocks >= (position + 1) // 4, -float("inf"))
+            chosen = torch.topk(scores, min(512, scores.numel())).indices
+            selected = (chosen[:, None] * 4 + torch.arange(4, device=value.device)).flatten()
+            pending = ((position + 1) // 4) * 4 + torch.arange(4, device=value.device)
+            selected = torch.cat([selected, pending])
+            selected = torch.where(selected <= position, selected, -1).int()
+        output = ops.attention(
+            q, self.keys, self.values, position, selected, dense_limit=self.dense_limit
+        )
         return F.linear((output * torch.sigmoid(gate)).reshape(1, -1), self.out)
 
 
@@ -222,7 +233,7 @@ class PLE:
 
 
 class Layer:
-    def __init__(self, weights, index, rank, world, config, capacity):
+    def __init__(self, weights, index, rank, world, config, capacity, execution_limit=None):
         prefix = f"model.language_model.layers.{index}"
         self.hc_attn = HyperConnection(weights, prefix + ".attn_hyper_connection")
         self.hc_mlp = HyperConnection(weights, prefix + ".mlp_hyper_connection")
@@ -230,7 +241,7 @@ class Layer:
         self.attn = (
             GDN(weights, prefix + ".linear_attn", rank, world)
             if linear
-            else QSA(weights, prefix + ".self_attn", rank, world, capacity)
+            else QSA(weights, prefix + ".self_attn", rank, world, capacity, execution_limit)
         )
         self.linear = linear
         self.ple = (
@@ -282,7 +293,11 @@ class Layer:
 
 
 class Qwen38Runner:
-    def __init__(self, model, rank, world, capacity=4096):
+    def __init__(self, model, rank, world, capacity=4096, *, execution_limit=None):
+        if execution_limit is not None and (
+            type(execution_limit) is not int or not 0 < execution_limit <= capacity
+        ):
+            raise ValueError("execution limit must be positive and within context capacity")
         config = json.loads((Path(model) / "config.json").read_text())
         self.config = validate_config(config, world, capacity)
         self.device = torch.device("cuda", rank)
@@ -296,7 +311,9 @@ class Qwen38Runner:
         self.head = weights.get("lm_head.weight", rows)
         self.layers = []
         for index in range(48):
-            self.layers.append(Layer(weights, index, rank, world, self.config, capacity))
+            self.layers.append(
+                Layer(weights, index, rank, world, self.config, capacity, execution_limit)
+            )
             if rank == 0:
                 print(f"loaded Qwen3.8 layer {index + 1}/48", flush=True)
         self.mixer = HyperConnection(weights, "model.language_model.hyper_connection_mixer")

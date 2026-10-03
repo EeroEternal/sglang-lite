@@ -49,6 +49,9 @@ def main():
     parser.add_argument("--warm-runs", type=int, default=3)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--full-logits", action="store_true", help="controlled old logits gather")
+    parser.add_argument(
+        "--full-qsa-selection", action="store_true", help="controlled unpruned QSA index scoring"
+    )
     parser.add_argument("--capacity", type=int, default=4096)
     args = parser.parse_args()
     lengths = parse_lengths(args.lengths)
@@ -71,6 +74,7 @@ def main():
     required = max(max(lengths) + (4 if args.profile else 0), 5)
     if not prompt_ids or len(prompt_ids) + required > args.capacity:
         parser.error("prompt/generation exceeds context")
+    execution_limit = None if args.full_qsa_selection else len(prompt_ids) + required
     output = Path(args.out).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     report = {
@@ -85,6 +89,7 @@ def main():
         "cuda_version": torch.version.cuda,
         "gpu_name": torch.cuda.get_device_name(rank),
         "capacity": args.capacity,
+        "qsa_execution_limit": execution_limit,
         "flashinfer_version": importlib.metadata.version("flashinfer-python"),
         "config_sha256": hashlib.sha256((model / "config.json").read_bytes()).hexdigest(),
         "index_sha256": hashlib.sha256(
@@ -97,7 +102,9 @@ def main():
     dist.init_process_group("nccl")
     graph = None
     try:
-        runner = Qwen38Runner(str(model), rank, world, args.capacity)
+        runner = Qwen38Runner(
+            str(model), rank, world, args.capacity, execution_limit=execution_limit
+        )
         prompt_gpu = torch.tensor(prompt_ids, device=runner.device, dtype=torch.int64)
         generated = torch.empty(args.capacity, device=runner.device, dtype=torch.int64)
 

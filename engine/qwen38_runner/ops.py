@@ -118,20 +118,24 @@ def _attention(
     CAPACITY: tl.constexpr,
     SELECTED: tl.constexpr,
     BUDGET: tl.constexpr,
+    DENSE_LIMIT: tl.constexpr,
     DIM: tl.constexpr = 256,
     BLOCK: tl.constexpr = 32,
 ):
     head = tl.program_id(0)
     position = tl.load(positions).to(tl.int32)
+    if DENSE_LIMIT:
+        tl.device_assert(position >= 0, "negative dense attention position")
+        tl.device_assert(position < DENSE_LIMIT, "dense attention execution limit exceeded")
     columns = tl.arange(0, DIM)
     query = tl.load(q + head * DIM + columns).to(tl.float32)
     maximum = tl.full((), -float("inf"), tl.float32)
     denominator = tl.full((), 0.0, tl.float32)
     numerator = tl.full((DIM,), 0.0, tl.float32)
-    length = position + 1 if position < BUDGET else SELECTED
+    length = position + 1 if DENSE_LIMIT else (position + 1 if position < BUDGET else SELECTED)
     for start in range(tl.cdiv(length, BLOCK)):
         rows = start * BLOCK + tl.arange(0, BLOCK)
-        if position < BUDGET:
+        if DENSE_LIMIT or position < BUDGET:
             slots = rows
         else:
             slots = tl.load(selected + rows, mask=rows < SELECTED, other=-1)
@@ -153,7 +157,9 @@ def _attention(
     tl.store(output + head * DIM + columns, numerator / denominator)
 
 
-def attention(q, keys, values, position, selected, budget=2048):
+def attention(q, keys, values, position, selected, budget=2048, *, dense_limit=0):
+    if not 0 <= dense_limit <= min(budget, keys.shape[0]):
+        raise ValueError("dense attention limit must fit its budget and KV capacity")
     output = torch.empty_like(q)
     _attention[(q.shape[0],)](
         q,
@@ -165,6 +171,8 @@ def attention(q, keys, values, position, selected, budget=2048):
         keys.shape[0],
         selected.numel(),
         budget,
+        dense_limit,
         num_warps=8,
+        debug=bool(dense_limit),
     )
     return output

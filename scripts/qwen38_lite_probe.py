@@ -84,11 +84,14 @@ def main():
         "graph": args.graph,
         "capacity": args.capacity,
         "teacher_forced": args.teacher_force,
+        "qsa_execution_limit": len(ids) + required,
     }
     graph = None
     try:
         load_start = time.perf_counter()
-        runner = Qwen38Runner(args.model, rank, world, args.capacity)
+        runner = Qwen38Runner(
+            args.model, rank, world, args.capacity, execution_limit=len(ids) + required
+        )
         report["load_s"] = time.perf_counter() - load_start
         audit = tensor_audit(runner)
         audit_path = Path(args.out).with_suffix(f".rank{rank}.audit.json")
