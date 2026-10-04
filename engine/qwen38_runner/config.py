@@ -1,6 +1,18 @@
 """Fail closed on model shapes/equations outside the dedicated prototype."""
 
 
+def attention_layout(rank, world, attention_tp):
+    if (
+        world != 8
+        or type(attention_tp) is not int
+        or attention_tp not in (2, 4, 8)
+        or not 0 <= rank < world
+    ):
+        raise ValueError("attention mesh requires eight GPUs and attention TP2/TP4/TP8")
+    start = rank // attention_tp * attention_tp
+    return tuple(range(start, start + attention_tp)), rank - start
+
+
 def validate_config(config, world, capacity):
     if world != 8 or not 4 <= capacity <= 4096 or capacity % 4:
         raise ValueError("prototype requires TP8/EP8 and page-aligned context <=4096")

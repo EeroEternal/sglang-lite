@@ -372,3 +372,71 @@ kernel 合计仍不是请求 wall time。
 
 **目前 runner 256-token 89.46 tok/s，仍低于既有 SGLang 请求端参考
 114.45 tok/s；计时范围不同，主 KPI 尚未达成。**
+
+## 8. 延续实验：GDN/MoE、attention 拓扑与 QSA 状态写入（2026-10-04）
+
+本节接续上轮未完成的会话；所有 lite 测速仍是单序列 runner generation，
+含 prefill、tokenizer 和输出 decode，但**不含 serving 调度**。
+同一 checkpoint、8×5090、TP8/EP8、PP1、4096 KV capacity、
+11-token prompt、三次 warm；除特别注明外 attention TP8。
+完整数值正确性与服务端 KPI 均未验收。
+
+1. GDN 四项卷积求和按原 CUDA 归约顺序融合，SiLU 保留 eager；
+   immutable Gemma RMS scale 预缓存。64-step teacher forcing 的 ID 与
+   selected-token logprob 与此前完全一致。单项对照的 256-token runner
+   由 89.48 升至约 92.02 tok/s。打包 GDN 投影曾出现一项 BF16 差异，
+   未保留。
+2. 48 层复用单 token MoE 的约 1.6 MB GPU workspace，routing 的归一化
+   和 top-k ID 转换合成一次 GPU kernel；256-token runner 约
+   92.90 tok/s，teacher-forced ID/logprob 不变。MoE autotune 曾测到约
+   95.42 tok/s，但重复输出不一致，**不得采用**。
+3. 保持 expert EP8，尝试 attention TP4/TP2（分别有 2/4 组复制的
+   attention 计算）；其 64/128/256-token runner 为
+   81.17/86.82/92.12 与 77.34/83.40/87.13 tok/s，
+   都不优于 TP8 的 84.34/90.20/92.90。三种结构的 teacher forcing
+   对确定性参考均是 63/64 top1、第 44 token 首次分歧；
+   不据此宣称跨结构逐位相等。默认继续 TP8。
+4. 标准 SGLang **独立重测** attention DP1/DP2/DP4 的
+   64/128/256-token 请求端 warm，分别为
+   82.13/96.78/105.77、57.05/66.62/79.81、
+   49.64/75.28/82.61 tok/s。DP4 的 64-token 原始时长
+   1.615549/1.289401/0.967142 秒，波动明显，不作精确速度归因。
+   此次 DP1 低于早期 114.45 tok/s 的 256-token 记录；两次均披露，
+   不用较慢的重测成绩替代已有较优基线，也不将 runner 与服务端时长混为一谈。
+
+继续在默认 attention TP8 上做 QSA 的固定开销削减：
+
+- 缓存每个 QSA 层 4 个 GPU 槽位偏移，不再每步调用 `torch.arange(4)`。
+  四次 replay 的 rank0 profile 少 48 个 `arange` kernel，总 kernel
+  数由 14,768 降至 14,720；256-token 中位数
+  **92.90→92.88 tok/s**，单独没有可确认的墙钟收益。
+- 将 compressed index 每四 token 的条件写入改成一个 Triton kernel，
+  不再对旧块做 `index_select` / `where` / `index_copy_`。
+  每次调用仍计算相同的压缩值，只在原来会写的 token 更新 GPU 状态。
+  相比紧邻的槽位缓存对照，四次 replay 的 rank0 kernel 数
+  **14,720→14,528**、累计 kernel 时间 **40.606→40.369 ms**；
+  kernel 时间不是请求墙钟。64/128/256-token runner 原始 warm 秒
+  分别为 **0.781280/0.781232/0.781324**、
+  **1.461797/1.461338/1.461170**、
+  **2.740230/2.739924/2.739776**；中位数
+  **81.92/87.59/93.43 tok/s**。紧邻槽位对照是
+  **81.46/87.13/92.88 tok/s**，256-token 改善约 0.6%；
+  早一批 MoE 对照的 64/128-token 数字更快，环境波动存在，
+  不能宣称所有长度相对那批都有收益。
+
+三组 64/128/256-token 输出 ID 与更早 MoE 对照逐项一致，warm 重复
+ID 一致；64-step teacher-forced 的 ID 和每项 selected-token logprob
+也完全一致，既有 **63/64 top1、第 44 token 分歧**没有修复。
+新 QSA 叶子测试逐步对照原条件写入的全部压缩状态；全 Qwen 聚焦测试
+**33 项通过**，本地不带 Torch 的 CPU 子集 **18 项通过**，Ruff 和
+`git diff --check` 通过。持久张量审计 rank0 为 1,676、其余各 1,484，
+全部 CUDA；新增 12 个槽位偏移张量/每 rank。进程退出后八卡各 2 MiB。
+审计不覆盖临时张量/NCCL host staging；跨 QSA budget、KV 恢复复用、
+完整数值验收与服务端吞吐仍待验证。
+
+新远端 artifact：`qwen38-owned-speed-slot-offsets.json`、
+`qwen38-owned-speed-compressed-write.json` 及其 `.trace.json`、
+`qwen38-owned-teacher-64-compressed-write.json` 和八个 rank audit；
+拓扑对照：`qwen38-owned-speed-attntp2.json`、
+`qwen38-owned-speed-attntp4.json`、
+`qwen38-sglang-refresh-attndp{1,2,4}.json`。

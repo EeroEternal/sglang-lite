@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from . import ops
-from .config import validate_config
+from .config import attention_layout, validate_config
 from .weights import NVFP4Experts, Weights, row_slice
 
 
@@ -73,9 +73,7 @@ class GDN:
 
     def __call__(self, value):
         projected = F.linear(value, self.input)
-        window = torch.cat([self.history, projected.reshape(-1, 1)], -1)
-        conv = F.silu((window.float() * self.conv.float()).sum(-1)).to(value.dtype)
-        self.history.copy_(window[:, 1:])
+        conv = F.silu(ops.gdn_conv_sum(projected, self.history, self.conv)).to(value.dtype)
         q, k, v = conv.split([self.keys * 128, self.keys * 128, self.values * 128])
         output = ops.gdn_update(
             q.reshape(-1, 128),
@@ -101,16 +99,17 @@ class QSA:
         self.k = weights.get(prefix + ".k_proj.weight", kv_rows)
         self.v = weights.get(prefix + ".v_proj.weight", kv_rows)
         self.out = weights.get(prefix + ".o_proj.weight", cols=row_slice(6144, rank, world))
-        self.qnorm = weights.get(prefix + ".q_norm.weight")
-        self.knorm = weights.get(prefix + ".k_norm.weight")
+        self.qnorm = weights.get(prefix + ".q_norm.weight").float() + 1.0
+        self.knorm = weights.get(prefix + ".k_norm.weight").float() + 1.0
         self.i_proj = weights.get(prefix + ".indexer.index_qk_proj.weight")
-        self.iqnorm = weights.get(prefix + ".indexer.q_layernorm.weight")
-        self.iknorm = weights.get(prefix + ".indexer.k_layernorm.weight")
+        self.iqnorm = weights.get(prefix + ".indexer.q_layernorm.weight").float() + 1.0
+        self.iknorm = weights.get(prefix + ".indexer.k_layernorm.weight").float() + 1.0
         self.keys = torch.zeros((capacity, 256), device=weights.device, dtype=torch.bfloat16)
         self.values = torch.zeros_like(self.keys)
         self.index_raw = torch.zeros((capacity, 128), device=weights.device, dtype=torch.bfloat16)
         blocks = (capacity + 3) // 4
         self.blocks = torch.arange(blocks, device=weights.device)
+        self.slot_offsets = torch.arange(4, device=weights.device)
         self.compressed = torch.zeros((blocks, 128), device=weights.device, dtype=torch.bfloat16)
         self.capacity = capacity
         self.dense_limit = execution_limit if execution_limit and execution_limit <= 2048 else 0
@@ -127,38 +126,35 @@ class QSA:
     def __call__(self, value, position, cos, sin, rope_cos, rope_sin):
         q_gate = F.linear(value, self.q).reshape(self.heads, 512)
         q, gate = q_gate.chunk(2, -1)
-        q = ops.rope(ops.rms(q, self.qnorm), cos, sin)
-        k = ops.rope(ops.rms(F.linear(value, self.k), self.knorm), cos, sin)
+        q = ops.rope(ops.rms(q, self.qnorm, gemma=False), cos, sin)
+        k = ops.rope(ops.rms(F.linear(value, self.k), self.knorm, gemma=False), cos, sin)
         self.keys.index_copy_(0, position, k)
         self.values.index_copy_(0, position, F.linear(value, self.v))
         index_qk = F.linear(value, self.i_proj).reshape(5, 128)
         self.index_raw.index_copy_(0, position, index_qk[4:])
         block = position // 4
-        slots = block * 4 + torch.arange(4, device=value.device)
+        slots = block * 4 + self.slot_offsets
         raw = (
             self.index_raw.index_select(0, slots.clamp_max(self.capacity - 1))
             .float()
             .mean(0, keepdim=True)
             .to(value.dtype)
         )
-        normalized = ops.rms(raw, self.iknorm)
+        normalized = ops.rms(raw, self.iknorm, gemma=False)
         block_start = block * 4
         compressed = ops.rope(
             normalized, rope_cos.index_select(0, block_start), rope_sin.index_select(0, block_start)
         )
-        old = self.compressed.index_select(0, block)
-        self.compressed.index_copy_(
-            0, block, torch.where((position % 4 == 3).reshape(1, 1), compressed, old)
-        )
+        ops.store_qsa_compressed(self.compressed, position, compressed)
         if self.dense_limit:
             selected = self.dense_selected
         else:
-            iq = ops.rope(ops.rms(index_qk[:4], self.iqnorm), cos, sin)
+            iq = ops.rope(ops.rms(index_qk[:4], self.iqnorm, gemma=False), cos, sin)
             scores = F.relu(iq.float() @ self.compressed.float().T).sum(0)
             scores = scores.masked_fill(self.blocks >= (position + 1) // 4, -float("inf"))
             chosen = torch.topk(scores, min(512, scores.numel())).indices
-            selected = (chosen[:, None] * 4 + torch.arange(4, device=value.device)).flatten()
-            pending = ((position + 1) // 4) * 4 + torch.arange(4, device=value.device)
+            selected = (chosen[:, None] * 4 + self.slot_offsets).flatten()
+            pending = ((position + 1) // 4) * 4 + self.slot_offsets
             selected = torch.cat([selected, pending])
             selected = torch.where(selected <= position, selected, -1).int()
         output = ops.attention(
@@ -201,9 +197,9 @@ class PLE:
         self.scale = weights.get(base + ".ngram_embedding.weight_scale", dtype=torch.bfloat16)
         self.key = weights.get(prefix + ".key_proj.weight")
         self.value = weights.get(prefix + ".value_proj.weight")
-        self.key_norm = weights.get(prefix + ".norm_key.weight")
-        self.query_norm = weights.get(prefix + ".norm_query.weight")
-        self.conv_norm = weights.get(prefix + ".norm_conv.weight")
+        self.key_norm = weights.get(prefix + ".norm_key.weight").float() + 1.0
+        self.query_norm = weights.get(prefix + ".norm_query.weight").float() + 1.0
+        self.conv_norm = weights.get(prefix + ".norm_conv.weight").float() + 1.0
         self.conv = weights.get(prefix + ".conv1d.weight")
         self.history = torch.zeros((1, 10240, 9), device=weights.device, dtype=torch.bfloat16)
         self.world = world
@@ -220,12 +216,14 @@ class PLE:
         embedding = ops.table_lookup(self.table, ids, self.start).reshape(1, 2560)
         dist.all_reduce(embedding)
         embedding = embedding * self.scale
-        key = ops.rms(F.linear(embedding, self.key), self.key_norm, group=2560).reshape(1, 4, 2560)
-        query = ops.rms(hidden, self.query_norm, group=2560).reshape(1, 4, 2560)
+        key = ops.rms(
+            F.linear(embedding, self.key), self.key_norm, group=2560, gemma=False
+        ).reshape(1, 4, 2560)
+        query = ops.rms(hidden, self.query_norm, group=2560, gemma=False).reshape(1, 4, 2560)
         gate = (key * query).sum(-1, keepdim=True) / (2560**0.5)
         gate = torch.sigmoid(gate.abs().clamp_min(1e-6).sqrt() * gate.sign())
         gated = (gate * F.linear(embedding, self.value).unsqueeze(1)).flatten(-2)
-        normalized = ops.rms(gated, self.conv_norm, group=2560)
+        normalized = ops.rms(gated, self.conv_norm, group=2560, gemma=False)
         window = torch.cat([self.history, normalized.unsqueeze(-1)], -1)
         conv = F.conv1d(window, self.conv, dilation=3, groups=10240).squeeze(-1)
         self.history.copy_(window[:, :, 1:])
@@ -233,15 +231,38 @@ class PLE:
 
 
 class Layer:
-    def __init__(self, weights, index, rank, world, config, capacity, execution_limit=None):
+    def __init__(
+        self,
+        weights,
+        index,
+        rank,
+        world,
+        config,
+        capacity,
+        execution_limit=None,
+        moe_workspace=None,
+        attention_tp=None,
+        attention_rank=None,
+        attention_group=None,
+    ):
         prefix = f"model.language_model.layers.{index}"
         self.hc_attn = HyperConnection(weights, prefix + ".attn_hyper_connection")
         self.hc_mlp = HyperConnection(weights, prefix + ".mlp_hyper_connection")
         linear = config["layer_types"][index] == "linear_attention"
+        attention_tp = world if attention_tp is None else attention_tp
+        attention_rank = rank if attention_rank is None else attention_rank
+        self.attention_group = attention_group
         self.attn = (
-            GDN(weights, prefix + ".linear_attn", rank, world)
+            GDN(weights, prefix + ".linear_attn", attention_rank, attention_tp)
             if linear
-            else QSA(weights, prefix + ".self_attn", rank, world, capacity, execution_limit)
+            else QSA(
+                weights,
+                prefix + ".self_attn",
+                attention_rank,
+                attention_tp,
+                capacity,
+                execution_limit,
+            )
         )
         self.linear = linear
         self.ple = (
@@ -250,7 +271,9 @@ class Layer:
             else None
         )
         self.router = weights.get(prefix + ".mlp.gate.weight")
-        self.experts = NVFP4Experts(weights, prefix + ".mlp", rank, world, config)
+        self.experts = NVFP4Experts(
+            weights, prefix + ".mlp", rank, world, config, workspace=moe_workspace
+        )
         self.shared = None
         if rank == 0:
             self.shared = [
@@ -277,12 +300,12 @@ class Layer:
             if self.linear
             else self.attn(value, position, cos, sin, rope_cos, rope_sin)
         )
-        dist.all_reduce(output)
+        dist.all_reduce(output, group=self.attention_group)
         hidden = self.hc_attn.combine(output, residual)
         value, residual = self.hc_mlp.mix(hidden)
         probabilities = F.softmax(F.linear(value, self.router).float(), -1)
         probabilities, ids = probabilities.topk(10, -1)
-        probabilities = probabilities / probabilities.sum(-1, keepdim=True)
+        probabilities, ids = ops.normalize_topk(probabilities, ids)
         output = self.experts(value, ids, probabilities)
         if self.shared is not None:
             gate, up, down, shared_gate = self.shared
@@ -293,7 +316,8 @@ class Layer:
 
 
 class Qwen38Runner:
-    def __init__(self, model, rank, world, capacity=4096, *, execution_limit=None):
+    def __init__(self, model, rank, world, capacity=4096, *, execution_limit=None, attention_tp=8):
+        attention_ranks, attention_rank = attention_layout(rank, world, attention_tp)
         if execution_limit is not None and (
             type(execution_limit) is not int or not 0 < execution_limit <= capacity
         ):
@@ -303,6 +327,15 @@ class Qwen38Runner:
         self.device = torch.device("cuda", rank)
         torch.cuda.set_device(self.device)
         self.rank, self.world, self.capacity = rank, world, capacity
+        self.attention_tp = attention_tp
+        self.attention_group = None
+        if attention_tp < world:
+            # Every rank creates the groups in the same order, including nonmembers.
+            for start in range(0, world, attention_tp):
+                members = list(range(start, start + attention_tp))
+                group = dist.new_group(ranks=members, backend="nccl")
+                if tuple(members) == attention_ranks:
+                    self.attention_group = group
         weights = Weights(model, self.device)
         vocab = self.config["vocab_size"]
         rows = row_slice(vocab, rank, world)
@@ -310,10 +343,25 @@ class Qwen38Runner:
         self.embedding = weights.get("model.language_model.embed_tokens.weight", rows)
         self.head = weights.get("lm_head.weight", rows)
         self.layers = []
+        self.moe_workspace = None
         for index in range(48):
             self.layers.append(
-                Layer(weights, index, rank, world, self.config, capacity, execution_limit)
+                Layer(
+                    weights,
+                    index,
+                    rank,
+                    world,
+                    self.config,
+                    capacity,
+                    execution_limit,
+                    self.moe_workspace,
+                    attention_tp,
+                    attention_rank,
+                    self.attention_group,
+                )
             )
+            # This runner executes one token on one stream; layers never overlap.
+            self.moe_workspace = self.layers[-1].experts.workspace
             if rank == 0:
                 print(f"loaded Qwen3.8 layer {index + 1}/48", flush=True)
         self.mixer = HyperConnection(weights, "model.language_model.hyper_connection_mixer")

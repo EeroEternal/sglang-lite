@@ -16,8 +16,8 @@ def engine_args(model: str, tp: int, attention_dp: int = 1) -> dict:
     """Use SM120 NVFP4 kernels without PLE, weight, or unified-memory offload."""
     if tp not in (2, 4, 8):
         raise ValueError("NVFP4 baseline requires --tp 2, 4, or 8")
-    if attention_dp not in (1, 2) or tp % attention_dp:
-        raise ValueError("attention DP must be 1 or 2 and divide TP")
+    if attention_dp not in (1, 2, 4) or tp % attention_dp:
+        raise ValueError("attention DP must be 1, 2 or 4 and divide TP")
     return {
         "model_path": model,
         "tp_size": tp,
@@ -77,7 +77,7 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--tp", type=int, default=8)
-    parser.add_argument("--attention-dp", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--attention-dp", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--prompt", default="Write a short explanation of why the sky is blue.")
     parser.add_argument("--lengths", default="64,128,256")
     parser.add_argument("--warm-runs", type=int, default=3)

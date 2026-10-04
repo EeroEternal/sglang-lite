@@ -58,8 +58,9 @@ def cutlass_up_gate(gate, up):
 class NVFP4Experts:
     """FlashInfer leaf kernel with checkpoint-preserving W4A4 scales."""
 
-    def __init__(self, weights, prefix, rank, world, config):
+    def __init__(self, weights, prefix, rank, world, config, workspace=None):
         from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
+        from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
 
         self.rank, self.world = rank, world
         count = config["num_experts"] // world
@@ -104,6 +105,32 @@ class NVFP4Experts:
         self.output = torch.empty(
             (1, config["hidden_size"]), dtype=torch.bfloat16, device=weights.device
         )
+        required = cutlass_fused_moe_workspace_size(
+            1,
+            config["hidden_size"],
+            config["moe_intermediate_size"],
+            config["num_experts"],
+            config["num_experts_per_tok"],
+            x_dtype=torch.bfloat16,
+            weight_dtype=self.w13.dtype,
+            ep_size=world,
+            ep_rank=rank,
+            device=weights.device,
+        )
+        self.workspace = (
+            torch.empty(required, dtype=torch.uint8, device=weights.device)
+            if workspace is None
+            else workspace
+        )
+        if (
+            self.workspace.device != weights.device
+            or self.workspace.dtype != torch.uint8
+            or self.workspace.numel() < required
+            or not self.workspace.is_contiguous()
+        ):
+            raise ValueError(
+                "MoE workspace must be a sufficiently sized contiguous CUDA byte buffer"
+            )
 
     def __call__(self, x, ids, probabilities):
         from flashinfer.fused_moe import cutlass_fused_moe
@@ -124,4 +151,5 @@ class NVFP4Experts:
             output=self.output,
             tune_max_num_tokens=1,
             activation_type=ActivationType.Swiglu,
+            workspace_buffer=self.workspace,
         )[0]

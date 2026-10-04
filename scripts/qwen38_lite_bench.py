@@ -1,6 +1,7 @@
 """Fixed-length owned-runner speed probe, separate from numerical diagnostics."""
 
 import argparse
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -53,6 +54,8 @@ def main():
         "--full-qsa-selection", action="store_true", help="controlled unpruned QSA index scoring"
     )
     parser.add_argument("--capacity", type=int, default=4096)
+    parser.add_argument("--moe-autotune", action="store_true")
+    parser.add_argument("--attention-tp", type=int, choices=(2, 4, 8), default=8)
     args = parser.parse_args()
     lengths = parse_lengths(args.lengths)
     if args.warm_runs < 1:
@@ -82,7 +85,15 @@ def main():
         "timing_scope": "runner generation including prefill, tokenization and output decode; no serving scheduler; reset and rank barrier excluded",
         "decode_timing_scope": "GPU events for N-1 graph decode steps; no per-token host synchronization",
         "acceptance": "experimental speed only; full numerical acceptance pending",
-        "parallel": {"tp": world, "ep": world, "attention_dp": 1, "pp": 1, "shared_expert_rank": 0},
+        "parallel": {
+            "tp": world,
+            "ep": world,
+            "attention_tp": args.attention_tp,
+            "attention_replicas": world // args.attention_tp,
+            "attention_dp": 1,
+            "pp": 1,
+            "shared_expert_rank": 0,
+        },
         "prompt": prompt,
         "prompt_ids": prompt_ids,
         "torch_version": torch.__version__,
@@ -97,13 +108,19 @@ def main():
         ).hexdigest(),
         "cases": [],
         "greedy_selection": "full-logits" if args.full_logits else "rank-candidates",
-        "gdn_conv": "eager",
+        "gdn_conv": "sum-fused/activation-eager",
+        "moe_autotune": args.moe_autotune,
     }
     dist.init_process_group("nccl")
     graph = None
     try:
         runner = Qwen38Runner(
-            str(model), rank, world, args.capacity, execution_limit=execution_limit
+            str(model),
+            rank,
+            world,
+            args.capacity,
+            execution_limit=execution_limit,
+            attention_tp=args.attention_tp,
         )
         prompt_gpu = torch.tensor(prompt_ids, device=runner.device, dtype=torch.int64)
         generated = torch.empty(args.capacity, device=runner.device, dtype=torch.int64)
@@ -114,8 +131,18 @@ def main():
             return runner.step_greedy(runner.token)
 
         runner.token.copy_(prompt_gpu[:1])
-        for _ in range(4):
-            runner.token.copy_(step())
+        tuning = contextlib.nullcontext()
+        if args.moe_autotune:
+            from flashinfer.autotuner import autotune
+
+            tuning = autotune(
+                True,
+                cache=str(output.with_suffix(f".rank{rank}.moe-tactics.json")),
+                tuning_buckets=(1,),
+            )
+        with tuning:
+            for _ in range(4):
+                runner.token.copy_(step())
         torch.cuda.synchronize()
         dist.barrier()
         graph = torch.cuda.CUDAGraph()

@@ -57,6 +57,7 @@ def main():
     p.add_argument("--teacher-force", action="store_true")
     p.add_argument("--graph", action="store_true")
     p.add_argument("--capacity", type=int, default=4096)
+    p.add_argument("--attention-tp", type=int, choices=(2, 4, 8), default=8)
     args = p.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -80,7 +81,15 @@ def main():
         "prompt_ids": ids,
         "ids": [],
         "logprobs": [],
-        "parallel": {"tp": world, "ep": world, "attention_dp": 1, "pp": 1, "shared_expert_rank": 0},
+        "parallel": {
+            "tp": world,
+            "ep": world,
+            "attention_tp": args.attention_tp,
+            "attention_replicas": world // args.attention_tp,
+            "attention_dp": 1,
+            "pp": 1,
+            "shared_expert_rank": 0,
+        },
         "graph": args.graph,
         "capacity": args.capacity,
         "teacher_forced": args.teacher_force,
@@ -90,7 +99,12 @@ def main():
     try:
         load_start = time.perf_counter()
         runner = Qwen38Runner(
-            args.model, rank, world, args.capacity, execution_limit=len(ids) + required
+            args.model,
+            rank,
+            world,
+            args.capacity,
+            execution_limit=len(ids) + required,
+            attention_tp=args.attention_tp,
         )
         report["load_s"] = time.perf_counter() - load_start
         audit = tensor_audit(runner)

@@ -100,6 +100,51 @@ class QwenGpuOpsTests(unittest.TestCase):
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
             history.copy_(window[:, 1:])
 
+    def test_fused_conv_sum_preserves_fp32_order_and_history(self):
+        for channels in [1280, 2560, 5120]:
+            history = torch.randn((channels, 3), device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn((channels, 4), device="cuda")
+            for _ in range(16):
+                projected = torch.randn((1, channels), device="cuda", dtype=torch.bfloat16)
+                window = torch.cat([history.clone(), projected.reshape(-1, 1)], -1)
+                expected = (window.float() * weight).sum(-1)
+                actual = self.ops.gdn_conv_sum(projected, history, weight)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                torch.testing.assert_close(history, window[:, 1:], atol=0, rtol=0)
+
+    def test_cached_gemma_norm_scale_is_exact(self):
+        for shape, group in [((3, 256), None), ((1, 128), None), ((1, 10240), 2560)]:
+            x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn(shape[-1], device="cuda", dtype=torch.bfloat16)
+            scale = weight.float() + 1.0
+            expected = self.ops.rms(x, weight, group=group)
+            actual = self.ops.rms(x, scale, group=group, gemma=False)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_topk_normalization_and_cast_are_exact(self):
+        for _ in range(32):
+            logits = torch.randn((1, 512), device="cuda") * 3
+            probabilities, ids = logits.softmax(-1).topk(10, -1)
+            expected = probabilities / probabilities.sum(-1, keepdim=True)
+            actual, actual_ids = self.ops.normalize_topk(probabilities, ids)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            torch.testing.assert_close(actual_ids, ids.int(), atol=0, rtol=0)
+
+    def test_qsa_compressed_write_only_on_complete_blocks(self):
+        original = torch.randn((3, 128), device="cuda", dtype=torch.bfloat16)
+        actual = original.clone()
+        expected = original.clone()
+        for pos in range(12):
+            position = torch.tensor([pos], device="cuda")
+            value = torch.randn((1, 128), device="cuda", dtype=torch.bfloat16)
+            block = position // 4
+            old = expected.index_select(0, block)
+            expected.index_copy_(
+                0, block, torch.where((position % 4 == 3).reshape(1, 1), value, old)
+            )
+            self.ops.store_qsa_compressed(actual, position, value)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
     def test_bounded_dense_attention_matches_full_kernel_exactly(self):
         q = torch.randn((3, 256), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
@@ -149,6 +194,9 @@ class QwenGpuOpsTests(unittest.TestCase):
         weights = FakeWeights()
         full = QSA(weights, "attn", 0, 8, 8)
         bounded = QSA(weights, "attn", 0, 8, 8, execution_limit=8)
+        self.assertEqual(full.slot_offsets.tolist(), [0, 1, 2, 3])
+        self.assertEqual(bounded.slot_offsets.tolist(), [0, 1, 2, 3])
+        slot_ptrs = (full.slot_offsets.data_ptr(), bounded.slot_offsets.data_ptr())
         angles = torch.randn((8, 32), device="cuda")
         cos, sin = angles.cos(), angles.sin()
         for pos in range(8):
@@ -160,6 +208,7 @@ class QwenGpuOpsTests(unittest.TestCase):
                 torch.testing.assert_close(
                     getattr(bounded, name), getattr(full, name), atol=0, rtol=0
                 )
+        self.assertEqual((full.slot_offsets.data_ptr(), bounded.slot_offsets.data_ptr()), slot_ptrs)
         fallback = QSA(weights, "attn", 0, 8, 8, execution_limit=2049)
         self.assertEqual(fallback.dense_limit, 0)
 

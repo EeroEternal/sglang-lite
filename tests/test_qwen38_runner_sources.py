@@ -77,7 +77,9 @@ class RunnerBoundaryTests(unittest.TestCase):
         tree = ast.parse(path.read_text())
         namespace = {}
         exec(compile(tree, str(path), "exec"), namespace)  # noqa: S102, trusted local config
-        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+        function = next(
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "validate_config"
+        )
         assignment = next(
             n
             for n in function.body
@@ -115,3 +117,22 @@ class RunnerBoundaryTests(unittest.TestCase):
         config["quantization_config"]["config_groups"]["group_0"]["weights"]["dynamic"] = True
         with self.assertRaises(ValueError):
             validate(config, 8, 4096)
+
+    def test_attention_groups_cover_global_ep_ranks(self):
+        path = Path(__file__).resolve().parents[1] / "engine" / "qwen38_runner" / "config.py"
+        namespace = {}
+        exec(compile(path.read_text(), str(path), "exec"), namespace)  # noqa: S102, trusted config
+        layout = namespace["attention_layout"]
+        for tp in [2, 4, 8]:
+            groups = set()
+            for rank in range(8):
+                members, local = layout(rank, 8, tp)
+                groups.add(members)
+                self.assertEqual(members[local], rank)
+                self.assertEqual(local, rank % tp)
+                self.assertEqual(len(members), tp)
+            self.assertEqual(len(groups), 8 // tp)
+            self.assertEqual(sorted(r for group in groups for r in group), list(range(8)))
+        for rank, world, tp in [(0, 4, 2), (8, 8, 4), (-1, 8, 2), (0, 8, 1), (0, 8, True)]:
+            with self.assertRaises(ValueError):
+                layout(rank, world, tp)

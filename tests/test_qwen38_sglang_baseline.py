@@ -1,11 +1,10 @@
 """Argument and measurement guards for the separate Qwen3.8 baseline."""
 
-import runpy
 import json
+import runpy
 import tempfile
 import unittest
 from pathlib import Path
-
 
 MODULE = runpy.run_path(
     str(Path(__file__).resolve().parents[1] / "scripts" / "qwen38_sglang_baseline.py")
@@ -48,15 +47,16 @@ class Qwen38BaselineTests(unittest.TestCase):
             MODULE["engine_args"]("/model", 1)
 
     def test_attention_dp_preserves_global_expert_group(self):
-        args = MODULE["engine_args"]("/model", 8, 2)
-        self.assertEqual(args["tp_size"], 8)
-        self.assertEqual(args["ep_size"], 8)
-        self.assertEqual(args["dp_size"], 2)
-        self.assertIs(args["enable_dp_attention"], True)
+        for dp in (2, 4):
+            args = MODULE["engine_args"]("/model", 8, dp)
+            self.assertEqual(args["tp_size"], 8)
+            self.assertEqual(args["ep_size"], 8)
+            self.assertEqual(args["dp_size"], dp)
+            self.assertIs(args["enable_dp_attention"], True)
 
     def test_unsupported_attention_dp_is_rejected(self):
         with self.assertRaises(ValueError):
-            MODULE["engine_args"]("/model", 8, 4)
+            MODULE["engine_args"]("/model", 8, 3)
 
     def test_incomplete_generation_is_not_a_throughput_sample(self):
         class FakeEngine:

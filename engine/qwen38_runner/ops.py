@@ -18,7 +18,10 @@ def rms(x, weight, eps=1e-6, group=None, gemma=True):
     if group:
         y = y.reshape(*shape[:-1], -1, group)
     y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
-    y = y.reshape(shape) * (weight.float() + (1.0 if gemma else 0.0))
+    scale = weight.float()
+    if gemma:
+        scale = scale + 1.0
+    y = y.reshape(shape) * scale
     return y.to(x.dtype)
 
 
@@ -66,6 +69,99 @@ def gdn_update(q, k, v, z, b, a, bias, log_a, state, norm):
     output = output.to(v.dtype).float()
     output = output * torch.rsqrt(output.square().mean(-1, keepdim=True) + 1e-6)
     return (output * norm.float() * torch.sigmoid(z.float())).to(v.dtype).reshape(1, -1)
+
+
+@triton.jit
+def _gdn_conv_sum(projected, history, weight, output, CHANNELS: tl.constexpr, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = rows < CHANNELS
+    h0 = tl.load(history + rows * 3, mask=valid, other=0).to(tl.float32)
+    h1 = tl.load(history + rows * 3 + 1, mask=valid, other=0).to(tl.float32)
+    h2 = tl.load(history + rows * 3 + 2, mask=valid, other=0).to(tl.float32)
+    value = tl.load(projected + rows, mask=valid, other=0).to(tl.float32)
+    w0 = tl.load(weight + rows * 4, mask=valid, other=0)
+    w1 = tl.load(weight + rows * 4 + 1, mask=valid, other=0)
+    w2 = tl.load(weight + rows * 4 + 2, mask=valid, other=0)
+    w3 = tl.load(weight + rows * 4 + 3, mask=valid, other=0)
+    # Match ATen's four-tap shuffle reduction, with separately rounded products.
+    result = (h0 * w0 + h2 * w2) + (h1 * w1 + value * w3)
+    tl.store(output + rows, result, mask=valid)
+    tl.store(history + rows * 3, h1, mask=valid)
+    tl.store(history + rows * 3 + 1, h2, mask=valid)
+    tl.store(history + rows * 3 + 2, value, mask=valid)
+
+
+def gdn_conv_sum(projected, history, weight):
+    channels = history.shape[0]
+    if (
+        history.shape != (channels, 3)
+        or weight.shape != (channels, 4)
+        or projected.numel() != channels
+        or weight.dtype != torch.float32
+        or projected.dtype != history.dtype
+        or not all(t.is_contiguous() for t in (projected, history, weight))
+    ):
+        raise ValueError(
+            "GDN conv requires contiguous matching projections/history and FP32 weights"
+        )
+    output = torch.empty(channels, device=projected.device, dtype=torch.float32)
+    _gdn_conv_sum[(triton.cdiv(channels, 256),)](
+        projected, history, weight, output, channels, 256, enable_fp_fusion=False
+    )
+    return output
+
+
+@triton.jit
+def _normalize_topk(probabilities, ids, normalized, int_ids, COUNT: tl.constexpr):
+    slots = tl.arange(0, 16)
+    values = tl.load(probabilities + slots, mask=slots < COUNT, other=0)
+    denominator = tl.sum(values, 0)
+    result = tl.div_rn(values, denominator)
+    indices = tl.load(ids + slots, mask=slots < COUNT, other=0).to(tl.int32)
+    tl.store(normalized + slots, result, mask=slots < COUNT)
+    tl.store(int_ids + slots, indices, mask=slots < COUNT)
+
+
+def normalize_topk(probabilities, ids):
+    if (
+        probabilities.shape != (1, 10)
+        or ids.shape != probabilities.shape
+        or probabilities.dtype != torch.float32
+        or ids.dtype != torch.int64
+        or not probabilities.is_contiguous()
+        or not ids.is_contiguous()
+    ):
+        raise ValueError("routing normalization requires contiguous FP32/Int64 single-token top-10")
+    normalized = torch.empty_like(probabilities)
+    int_ids = torch.empty_like(ids, dtype=torch.int32)
+    _normalize_topk[(1,)](
+        probabilities, ids, normalized, int_ids, 10, num_warps=1, enable_fp_fusion=False
+    )
+    return normalized, int_ids
+
+
+@triton.jit
+def _store_qsa_compressed(compressed, position, value, WIDTH: tl.constexpr):
+    columns = tl.arange(0, WIDTH)
+    token = tl.load(position)
+    tl.store(
+        compressed + (token // 4) * WIDTH + columns,
+        tl.load(value + columns),
+        mask=token % 4 == 3,
+    )
+
+
+def store_qsa_compressed(compressed, position, value):
+    if (
+        compressed.ndim != 2
+        or compressed.shape[1] != 128
+        or value.shape != (1, 128)
+        or compressed.dtype != value.dtype
+        or position.shape != (1,)
+        or not all(t.is_cuda and t.is_contiguous() for t in (compressed, position, value))
+    ):
+        raise ValueError("QSA compressed update requires contiguous CUDA blocks and one position")
+    _store_qsa_compressed[(1,)](compressed, position, value, 128, num_warps=4)
 
 
 @triton.jit
