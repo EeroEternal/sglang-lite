@@ -48,8 +48,12 @@ class GDN:
         self.input = torch.cat([weights.get(prefix + ".in_proj_qkv.weight", s) for s in sections])
         self.z = weights.get(prefix + ".in_proj_z.weight", vs)
         hs = row_slice(48, rank, world)
-        self.a = weights.get(prefix + ".in_proj_a.weight", hs)
-        self.b = weights.get(prefix + ".in_proj_b.weight", hs)
+        self.ab = torch.cat(
+            [
+                weights.get(prefix + ".in_proj_b.weight", hs),
+                weights.get(prefix + ".in_proj_a.weight", hs),
+            ]
+        )
         self.bias = weights.get(prefix + ".dt_bias", hs, dtype=torch.float32)
         self.log_a = weights.get(prefix + ".A_log", hs, dtype=torch.float32)
         self.conv = (
@@ -72,7 +76,7 @@ class GDN:
         self.state.zero_()
 
     def __call__(self, value):
-        b = F.linear(value, self.b).flatten()
+        b, a = F.linear(value, self.ab).flatten().chunk(2)
         projected = F.linear(value, self.input)
         conv, beta = ops.gdn_conv_activated(projected, self.history, self.conv, b)
         q, k, v = conv.split([self.keys * 128, self.keys * 128, self.values * 128])
@@ -82,7 +86,7 @@ class GDN:
             v.reshape(-1, 128),
             F.linear(value, self.z).reshape(-1, 128),
             beta,
-            F.linear(value, self.a).flatten(),
+            a,
             self.bias,
             self.log_a,
             self.state,
@@ -97,8 +101,12 @@ class QSA:
         self.q = weights.get(prefix + ".q_proj.weight", row_slice(12288, rank, world))
         kv_rank = rank // (world // 2)
         kv_rows = row_slice(512, kv_rank, 2)
-        self.k = weights.get(prefix + ".k_proj.weight", kv_rows)
-        self.v = weights.get(prefix + ".v_proj.weight", kv_rows)
+        self.kv = torch.cat(
+            [
+                weights.get(prefix + ".k_proj.weight", kv_rows),
+                weights.get(prefix + ".v_proj.weight", kv_rows),
+            ]
+        )
         self.out = weights.get(prefix + ".o_proj.weight", cols=row_slice(6144, rank, world))
         self.qnorm = weights.get(prefix + ".q_norm.weight").float() + 1.0
         self.knorm = weights.get(prefix + ".k_norm.weight").float() + 1.0
@@ -128,9 +136,10 @@ class QSA:
         q_gate = F.linear(value, self.q).reshape(self.heads, 512)
         q, gate = q_gate.chunk(2, -1)
         q = ops.rope(ops.rms(q, self.qnorm, gemma=False), cos, sin)
-        k = ops.rope(ops.rms(F.linear(value, self.k), self.knorm, gemma=False), cos, sin)
+        k_raw, v = F.linear(value, self.kv).chunk(2, -1)
+        k = ops.rope(ops.rms(k_raw, self.knorm, gemma=False), cos, sin)
         self.keys.index_copy_(0, position, k)
-        self.values.index_copy_(0, position, F.linear(value, self.v))
+        self.values.index_copy_(0, position, v)
         index_qk = F.linear(value, self.i_proj).reshape(5, 128)
         self.index_raw.index_copy_(0, position, index_qk[4:])
         block = position // 4

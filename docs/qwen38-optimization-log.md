@@ -748,3 +748,108 @@ scheduler，不能拿 runner tok/s 当服务 KPI。
 远端 8×5090 聚焦 GPU/源码/benchmark/基线回归 **39 项通过**，
 退出后八卡各 2 MiB。跨 QSA budget、更多 prompt、状态复用
 与请求端同口径测速仍未完成。
+
+## 15. AllReduce 配置试验与 GDN 小 GEMV 打包（2026-10-04）
+
+第 14 节基线 rank0 四次 graph replay 有 **392 次 AllReduce**，
+GPU kernel 累计约 **8.96 ms**；同时按 GEMV 名称汇总约
+**2,700 次、9.75 ms**。同机 8×5090 无 NVLink，部分 GPU
+间经跨 NUMA 的 `SYS` 路径。两类累计 kernel 时间均**不是**
+可直接节省的墙钟；48 层串行依赖限制相邻层的跨层合并。
+
+先独立测试 NCCL 通信参数，未改模型代码。强制
+`NCCL_ALGO=Tree` 使已存在的 AllGather 报
+`no algorithm/protocol available`，无法完成数值验收；
+`NCCL_PROTO=LL128` 和 `NCCL_PROTO=Simple` 均能完成
+128-token graph teacher forcing，并保持 **128/128 top1**，
+但相对默认协议各有 **123/128 项 selected-token logprob
+不相等**，最大差异 **0.325581**。不能用只匹配 token ID
+替代数值门槛，**三个配置均不采用，也不声明 AllReduce
+次数或时间得到优化**。
+
+针对小 GEMV，每个 GDN 层原有两个依赖同一 `value` 的
+BF16 六行投影 `in_proj_b` 和 `in_proj_a`；在权重加载时
+按 b、a 顺序打包为十二行，将两次 `F.linear` 合为一次，
+其余投影、gate、recurrent、MoE 与通信调用不变。
+GPU 随机 128 组输入在 2560/10240 输入宽度的两个
+BF16 六行输出均逐位相等；真实权重 128-token graph
+teacher forcing 的 ID、每项 selected-token logprob 与
+原版逐项相同，自由生成亦逐项相同，二者均与确定性参考
+**128/128 ID** 匹配。另检查 rank0 共享专家两个 640
+行投影打包，随机输入出现 **8 项 BF16 不一致**，未采用。
+
+同机同权重、11-token prompt、TP8/EP8/attention TP8、
+4096 capacity，默认 NCCL 配置、相同 `--profile`，
+每次 cold 后三次 warm；依次旧版→打包版与打包版→旧版：
+
+| 次序/长度 | 旧版三次 warm 秒 | 打包版三次 warm 秒 | runner 中位 tok/s（旧→新） |
+|---|---|---|---:|
+| 正向/64 | 0.707870 / 0.708631 / 0.709303 | 0.672524 / 0.672467 / 0.672489 | 90.32→95.17 |
+| 正向/128 | 1.312078 / 1.271563 / 1.271418 | 1.257577 / 1.306122 / 1.275635 | 100.66→100.34 |
+| 正向/256 | 2.469954 / 2.469322 / 2.469110 | 2.442731 / 2.442775 / 2.442804 | 103.67→104.80 |
+| 反向/64 | 0.680004 / 0.679751 / 0.680121 | 0.700099 / 0.700699 / 0.702536 | 94.12→91.34 |
+| 反向/128 | 1.314300 / 1.322874 / 1.322846 | 1.310551 / 1.263627 / 1.257816 | 96.76→101.30 |
+| 反向/256 | 2.469232 / 2.469250 / 2.468834 | 2.443485 / 2.443557 / 2.443443 | 103.68→104.77 |
+
+两轮 256-token 约 **+1.1%**，decode GPU event
+**9.287→9.187**、**9.286→9.190 ms/step**。rank0 四次
+replay kernel 数 **12,224→12,080**（每 token 减少
+36 次小 GEMV），累计时间正向 **41.631→41.183 ms**、
+反向 **41.571→41.212 ms**；AllReduce 仍 **392 次**
+（每 token 98 次）。64/128-token 正反结果矛盾，
+不宣称短输出稳定改善。旧/新版各长度 ID 和各组 warm
+重复 ID 均相等。这些是单序列 runner 结果，不是与
+SGLang Engine.generate 同口径的请求端 KPI。
+
+原始 artifact：`qwen38-gdn-ab-{control-paired,candidate-paired,reverse-candidate,reverse-control}.json`
+及 `.trace.json`、`qwen38-gdn-packed-ab-{teacher128,free128}.json`、
+`qwen38-nccl-{ll128,simple}-teacher128.json`。
+远端八卡聚焦 GPU/源码/benchmark/基线 **40 项通过**，
+退出后八卡各 2 MiB。仍未验收更多 prompt、长上下文、
+跨 QSA budget、状态复用及服务端吞吐。
+
+## 16. QSA K/V GEMV 打包（2026-10-04）
+
+在第 15 节未提交的 GDN a/b 打包版本上，继续减少 12 个
+QSA 层各自的小型 GEMV。QSA 的 K/V 权重各有 256 行、相同
+2560 列和同一个输入：加载时以 K、V 顺序拼成 512 行，
+把两次 `F.linear` 改为一次，再切回原 K/V。
+没有打包 512+512 行的其他 GEMV：随机输入测试曾出现
+**16 项 BF16 差异**。当前 K/V 256+256 行在 128 组 GPU
+随机输入逐位等于两次原始计算；真实权重的 128-token
+graph teacher forcing **所有 ID 和 selected-token logprob**
+以及自由生成 ID/logprob 均与 GDN-only 版本逐项相等，
+两种路径仍与确定性参考 **128/128 ID** 匹配。
+
+同机同权重、11-token prompt、TP8/EP8/attention TP8、
+4096 capacity、默认 NCCL、相同 `--profile`，每次先 cold
+再三次 warm；依次旧版→K/V 打包与反向 K/V 打包→旧版：
+
+| 次序/长度 | GDN-only 三次 warm 秒 | 再打包 QSA 三次 warm 秒 | runner 中位 tok/s（旧→新） |
+|---|---|---|---:|
+| 正向/64 | 0.702963 / 0.701588 / 0.701436 | 0.670040 / 0.670084 / 0.670380 | 91.22→95.51 |
+| 正向/128 | 1.311397 / 1.311555 / 1.285169 | 1.301528 / 1.305901 / 1.305809 | 97.61→98.02 |
+| 正向/256 | 2.443262 / 2.442855 / 2.443368 | 2.434223 / 2.434800 / 2.434681 | 104.78→105.15 |
+| 反向/64 | 0.673083 / 0.672917 / 0.672914 | 0.698327 / 0.698502 / 0.698838 | 95.11→91.63 |
+| 反向/128 | 1.258610 / 1.258625 / 1.258640 | 1.272403 / 1.252744 / 1.253083 | 101.70→102.15 |
+| 反向/256 | 2.443723 / 2.443432 / 2.444197 | 2.433836 / 2.433478 / 2.433822 | 104.76→105.18 |
+
+两轮 256-token runner 约 **+0.36%**，decode event
+**9.189→9.157**、**9.191→9.153 ms/step**；rank0
+四次 replay kernel 数 **12,080→12,032**，每步少
+12 个 GEMV，累计 kernel 时间正向 **41.318→41.180 ms**、
+反向 **41.337→41.148 ms**。64-token 正反方向的墙钟
+结论相反；128-token 两组中位虽略快，也不把这一幅度视为
+已验证的稳定短输出收益。所有基线/候选及各自 warm ID
+逐项相同。AllReduce 仍是 **98 次/token**，本轮只优化
+12 个 QSA GEMV；GPU kernel 累计时间不等于 runner
+或服务端请求时长。
+
+原始 artifact：
+`qwen38-qsa-kv-{control-paired,candidate-paired,reverse-candidate,reverse-control}.json`
+及各 `.trace.json`，
+`qwen38-qsa-packed-kv-{teacher128,free128}.json`。
+远端八卡聚焦 GPU/源码/benchmark/基线 **41 项通过**，
+进程退出后八卡各 2 MiB。仍只验证单 prompt、
+短上下文与单序列 runner；跨 QSA budget、更多 prompt、
+状态复用和请求端同口径 KPI 未验收。

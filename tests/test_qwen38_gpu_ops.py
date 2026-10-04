@@ -142,6 +142,37 @@ class QwenGpuOpsTests(unittest.TestCase):
                 torch.testing.assert_close(history, window[:, 1:], atol=0, rtol=0)
                 torch.testing.assert_close(beta, b.float().sigmoid().to(b.dtype), atol=0, rtol=0)
 
+    def test_packed_gdn_a_b_gemv_matches_separate_bf16(self):
+        for channels in (2560, 10240):
+            b_weight = torch.randn((6, channels), device="cuda", dtype=torch.bfloat16)
+            a_weight = torch.randn_like(b_weight)
+            packed = torch.cat([b_weight, a_weight])
+            for seed in range(128):
+                value = torch.randn((1, channels), device="cuda", dtype=torch.bfloat16) * (
+                    seed % 11 + 1
+                )
+                b, a = torch.nn.functional.linear(value, packed).flatten().chunk(2)
+                torch.testing.assert_close(
+                    b, torch.nn.functional.linear(value, b_weight).flatten(), atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    a, torch.nn.functional.linear(value, a_weight).flatten(), atol=0, rtol=0
+                )
+
+    def test_packed_qsa_k_v_gemv_matches_separate_bf16(self):
+        k_weight = torch.randn((256, 2560), device="cuda", dtype=torch.bfloat16)
+        v_weight = torch.randn_like(k_weight)
+        packed = torch.cat([k_weight, v_weight])
+        for seed in range(128):
+            value = torch.randn((1, 2560), device="cuda", dtype=torch.bfloat16) * (seed % 11 + 1)
+            k, v = torch.nn.functional.linear(value, packed).chunk(2, -1)
+            torch.testing.assert_close(
+                k, torch.nn.functional.linear(value, k_weight), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                v, torch.nn.functional.linear(value, v_weight), atol=0, rtol=0
+            )
+
     def test_shared_expert_side_stream_graph_matches_serial(self):
         from qwen38_runner.model import Layer
 
