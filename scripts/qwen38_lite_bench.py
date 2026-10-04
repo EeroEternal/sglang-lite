@@ -49,17 +49,21 @@ def main():
     parser.add_argument("--lengths", default="64,128,256")
     parser.add_argument("--warm-runs", type=int, default=3)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-all-ranks", action="store_true")
     parser.add_argument("--full-logits", action="store_true", help="controlled old logits gather")
     parser.add_argument(
         "--full-qsa-selection", action="store_true", help="controlled unpruned QSA index scoring"
     )
     parser.add_argument("--capacity", type=int, default=4096)
     parser.add_argument("--moe-autotune", action="store_true")
+    parser.add_argument("--serial-shared-expert", action="store_true", help="paired control")
     parser.add_argument("--attention-tp", type=int, choices=(2, 4, 8), default=8)
     args = parser.parse_args()
     lengths = parse_lengths(args.lengths)
     if args.warm_runs < 1:
         parser.error("warm runs must be positive")
+    if args.profile_all_ranks and not args.profile:
+        parser.error("--profile-all-ranks requires --profile")
 
     import torch
     import torch.distributed as dist
@@ -93,6 +97,7 @@ def main():
             "attention_dp": 1,
             "pp": 1,
             "shared_expert_rank": 0,
+            "shared_expert_stream": not args.serial_shared_expert,
         },
         "prompt": prompt,
         "prompt_ids": prompt_ids,
@@ -121,6 +126,7 @@ def main():
             args.capacity,
             execution_limit=execution_limit,
             attention_tp=args.attention_tp,
+            shared_expert_stream=not args.serial_shared_expert,
         )
         prompt_gpu = torch.tensor(prompt_ids, device=runner.device, dtype=torch.int64)
         generated = torch.empty(args.capacity, device=runner.device, dtype=torch.int64)
@@ -197,17 +203,29 @@ def main():
                 graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-            if rank == 0:
-                report["profile_start_position"] = len(prompt_ids) + max(lengths) - 1
+            if rank == 0 or args.profile_all_ranks:
+                trace = (
+                    output.with_suffix(f".rank{rank}.trace.json")
+                    if args.profile_all_ranks
+                    else output.with_suffix(".trace.json")
+                )
+                # The profilers run on every rank together so NCCL is still timed
+                # under the same eight-rank workload as the rank-0-only trace.
+                report["profile_trace_pattern"] = (
+                    "rank*.trace.json" if args.profile_all_ranks else ".trace.json"
+                )
+                if rank == 0:
+                    report["profile_start_position"] = len(prompt_ids) + max(lengths) - 1
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
                     for _ in range(4):
                         graph.replay()
                     torch.cuda.synchronize()
-                prof.export_chrome_trace(str(output.with_suffix(".trace.json")))
-                report["kernel_profile"] = prof.key_averages().table(
-                    sort_by="self_cuda_time_total", row_limit=30
-                )
-                print(report["kernel_profile"], flush=True)
+                prof.export_chrome_trace(str(trace))
+                if rank == 0:
+                    report["kernel_profile"] = prof.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=30
+                    )
+                    print(report["kernel_profile"], flush=True)
             else:
                 for _ in range(4):
                     graph.replay()

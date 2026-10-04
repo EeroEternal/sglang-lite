@@ -46,9 +46,14 @@ Strata 仅提供 GPU GEMV、expert reduction、GPU token 选择、减少设备�
 2. `engine/qwen38_runner/` 已有独立单序列文本原型，48 层真实权重加载与
    CUDA graph 捕获/释放已跑通。首轮八卡持久张量审计通过：rank0 为 1,650，
    其余各 1,458 个张量，全部 CUDA；不涵盖临时张量或 NCCL host staging。
-   自由生成前 43 token 匹配确定性参考，第 44 个分歧；64 步 teacher-forcing
-   的 top1 为 63/64，最大所选 token logprob 误差为 0.279。
-   **完整正确性、长上下文/状态复用和真实吞吐尚未验收**。来源见
+   修正 BF16 GDN gate 及 packed-decode recurrent 输出顺序后，固定短 prompt
+   的 64/128-token 自由生成 ID 与各自确定性参考完全一致；
+   teacher-forcing top1 分别为 64/64 和 128/128，但最大所选 token
+   logprob 误差分别仍约 0.144327 和 0.274001。
+   QSA RoPE 融合后的单序列 runner 在两轮配对的 256-token warm
+   约为 102.85/102.94 tok/s，不含 serving scheduler，不能与 SGLang 的 Engine.generate
+   直接当作等口径请求 KPI。**完整正确性、其他 prompt、长上下文/状态复用
+   和服务端吞吐尚未验收**。来源见
    [QWEN38_SOURCES.md](vendor/QWEN38_SOURCES.md)。
 3. 当前运行入口仍为 V4 默认。新路径验证前不翻转 gate 或宣称可部署。
 4. 旧 V4 代码、技术文档与未提交修改保留为历史/兼容资产，不批量删除。

@@ -52,27 +52,64 @@ def greedy_from_candidates(candidates):
     return candidates[:, 1].index_select(0, candidates[:, 0].argmax().reshape(1)).long()
 
 
+# Adapted from SGLang v0.5.20 fused_recurrent.py (Apache-2.0; derived from vLLM),
+# commit 94602c9c2b7cbdb8efd5c52802dac6a1c180089e.
+@triton.jit
+def _gdn_recurrent_reference(q, k, v, beta, a, bias, log_a, state, output):
+    i_v, i_hv = tl.program_id(0), tl.program_id(1)
+    o_k = tl.arange(0, 128)
+    o_v = i_v * 32 + tl.arange(0, 32)
+    head = i_hv // 3
+    b_h = tl.load(state + i_hv * 128 * 128 + o_v[:, None] * 128 + o_k[None, :]).to(tl.float32)
+    b_q = tl.load(q + head * 128 + o_k).to(tl.float32)
+    b_k = tl.load(k + head * 128 + o_k).to(tl.float32)
+    b_v = tl.load(v + i_hv * 128 + o_v).to(tl.float32)
+
+    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_q = b_q * (128**-0.5)
+
+    a_val = tl.load(a + i_hv).to(tl.float32)
+    b_val = tl.load(beta + i_hv).to(tl.float32)
+    x = a_val + tl.load(bias + i_hv).to(tl.float32)
+    softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    g_val = -tl.exp(tl.load(log_a + i_hv).to(tl.float32)) * softplus_x
+    b_h *= tl.exp(g_val)
+    b_v -= tl.sum(b_h * b_k[None, :], 1)
+    b_v *= b_val
+    b_h += b_v[:, None] * b_k[None, :]
+    b_o = tl.sum(b_h * b_q[None, :], 1)
+    tl.store(output + i_hv * 128 + o_v, b_o)
+    tl.store(state + i_hv * 128 * 128 + o_v[:, None] * 128 + o_k[None, :], b_h)
+
+
 @torch.compile(fullgraph=True)
-def gdn_update(q, k, v, z, b, a, bias, log_a, state, norm):
-    q, k = q.float(), k.float()
-    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
-    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
-    q = q.repeat_interleave(3, dim=0)
-    k = k.repeat_interleave(3, dim=0)
-    decay = torch.exp(-torch.exp(log_a.float()) * F.softplus(a.float() + bias.float()))
-    beta = torch.sigmoid(b.float())
-    updated = state * decay[:, None, None]
-    delta = (v.float() - (updated * k[:, None, :]).sum(-1)) * beta[:, None]
-    updated = updated + delta[:, :, None] * k[:, None, :]
-    output = (updated * q[:, None, :]).sum(-1) * (128**-0.5)
-    state.copy_(updated)
-    output = output.to(v.dtype).float()
+def _gdn_output_norm(output, z, norm):
+    output = output.float()
     output = output * torch.rsqrt(output.square().mean(-1, keepdim=True) + 1e-6)
-    return (output * norm.float() * torch.sigmoid(z.float())).to(v.dtype).reshape(1, -1)
+    return (output * norm.float() * torch.sigmoid(z.float())).to(z.dtype).reshape(1, -1)
+
+
+def gdn_update(q, k, v, z, beta, a, bias, log_a, state, norm):
+    output = torch.empty_like(v)
+    _gdn_recurrent_reference[(4, 6)](
+        q, k, v, beta, a, bias, log_a, state, output, num_warps=1, num_stages=3
+    )
+    return _gdn_output_norm(output, z, norm)
 
 
 @triton.jit
-def _gdn_conv_sum(projected, history, weight, output, CHANNELS: tl.constexpr, BLOCK: tl.constexpr):
+def _gdn_conv_sum(
+    projected,
+    history,
+    weight,
+    output,
+    b,
+    beta,
+    CHANNELS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WITH_BETA: tl.constexpr,
+):
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = rows < CHANNELS
     h0 = tl.load(history + rows * 3, mask=valid, other=0).to(tl.float32)
@@ -89,9 +126,13 @@ def _gdn_conv_sum(projected, history, weight, output, CHANNELS: tl.constexpr, BL
     tl.store(history + rows * 3, h1, mask=valid)
     tl.store(history + rows * 3 + 1, h2, mask=valid)
     tl.store(history + rows * 3 + 2, value, mask=valid)
+    if WITH_BETA and tl.program_id(0) == 0:
+        heads = tl.arange(0, 8)
+        gate = tl.load(b + heads, mask=heads < 6, other=0).to(tl.float32)
+        tl.store(beta + heads, tl.sigmoid(gate), mask=heads < 6)
 
 
-def gdn_conv_sum(projected, history, weight):
+def gdn_conv_sum(projected, history, weight, b=None):
     channels = history.shape[0]
     if (
         history.shape != (channels, 3)
@@ -104,11 +145,25 @@ def gdn_conv_sum(projected, history, weight):
         raise ValueError(
             "GDN conv requires contiguous matching projections/history and FP32 weights"
         )
+    if b is not None and (
+        b.shape != (6,) or b.dtype != torch.bfloat16 or not b.is_cuda or not b.is_contiguous()
+    ):
+        raise ValueError("GDN gate requires six contiguous CUDA BF16 heads")
     output = torch.empty(channels, device=projected.device, dtype=torch.float32)
+    beta = torch.empty_like(b) if b is not None else output
     _gdn_conv_sum[(triton.cdiv(channels, 256),)](
-        projected, history, weight, output, channels, 256, enable_fp_fusion=False
+        projected,
+        history,
+        weight,
+        output,
+        b if b is not None else projected,
+        beta,
+        channels,
+        256,
+        b is not None,
+        enable_fp_fusion=False,
     )
-    return output
+    return (output, beta) if b is not None else output
 
 
 @triton.jit
@@ -224,11 +279,55 @@ def table_lookup(table, ids, start):
     return output
 
 
+@triton.jit
+def _rope(x, cos, sin, output, WIDTH: tl.constexpr, HALF: tl.constexpr, TAIL: tl.constexpr):
+    row = tl.program_id(0)
+    columns = tl.arange(0, HALF)
+    first = tl.load(x + row * WIDTH + columns).to(tl.float32)
+    second = tl.load(x + row * WIDTH + HALF + columns).to(tl.float32)
+    angle_cos = tl.load(cos + columns)
+    angle_sin = tl.load(sin + columns)
+    tl.store(output + row * WIDTH + columns, first * angle_cos - second * angle_sin)
+    tl.store(
+        output + row * WIDTH + HALF + columns,
+        second * angle_cos + first * angle_sin,
+    )
+    tail = tl.arange(0, TAIL)
+    rest = tl.load(x + row * WIDTH + 2 * HALF + tail, mask=tail < WIDTH - 2 * HALF, other=0)
+    tl.store(
+        output + row * WIDTH + 2 * HALF + tail,
+        rest,
+        mask=tail < WIDTH - 2 * HALF,
+    )
+
+
 def rope(x, cos, sin):
     half = cos.shape[-1]
-    first, second = x[..., :half].float(), x[..., half : 2 * half].float()
-    rotated = torch.cat([first * cos - second * sin, second * cos + first * sin], -1)
-    return torch.cat([rotated.to(x.dtype), x[..., 2 * half :]], -1)
+    if (
+        x.ndim != 2
+        or x.shape not in ((1, 128), (4, 128), (1, 256), (3, 256), (6, 256), (12, 256))
+        or cos.shape != (1, half)
+        or sin.shape != cos.shape
+        or half != 32
+        or x.dtype != torch.bfloat16
+        or cos.dtype != torch.float32
+        or sin.dtype != torch.float32
+        or not all(t.is_cuda and t.is_contiguous() for t in (x, cos, sin))
+    ):
+        raise ValueError("QSA RoPE requires contiguous BF16 rows and single FP32 position")
+    output = torch.empty_like(x)
+    _rope[(x.shape[0],)](
+        x,
+        cos,
+        sin,
+        output,
+        x.shape[1],
+        half,
+        triton.next_power_of_2(x.shape[1] - 2 * half),
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+    return output
 
 
 @triton.jit

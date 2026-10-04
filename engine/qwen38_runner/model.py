@@ -72,15 +72,17 @@ class GDN:
         self.state.zero_()
 
     def __call__(self, value):
+        b = F.linear(value, self.b).flatten()
         projected = F.linear(value, self.input)
-        conv = F.silu(ops.gdn_conv_sum(projected, self.history, self.conv)).to(value.dtype)
+        conv_sum, beta = ops.gdn_conv_sum(projected, self.history, self.conv, b)
+        conv = F.silu(conv_sum).to(value.dtype)
         q, k, v = conv.split([self.keys * 128, self.keys * 128, self.values * 128])
         output = ops.gdn_update(
             q.reshape(-1, 128),
             k.reshape(-1, 128),
             v.reshape(-1, 128),
             F.linear(value, self.z).reshape(-1, 128),
-            F.linear(value, self.b).flatten(),
+            beta,
             F.linear(value, self.a).flatten(),
             self.bias,
             self.log_a,
@@ -238,6 +240,7 @@ class Layer:
         attention_tp=None,
         attention_rank=None,
         attention_group=None,
+        shared_stream=None,
     ):
         prefix = f"model.language_model.layers.{index}"
         self.hc_attn = HyperConnection(weights, prefix + ".attn_hyper_connection")
@@ -246,6 +249,7 @@ class Layer:
         attention_tp = world if attention_tp is None else attention_tp
         attention_rank = rank if attention_rank is None else attention_rank
         self.attention_group = attention_group
+        self.shared_stream = shared_stream
         self.attn = (
             GDN(weights, prefix + ".linear_attn", attention_rank, attention_tp)
             if linear
@@ -285,6 +289,11 @@ class Layer:
         if self.ple:
             self.ple.reset()
 
+    def _shared_expert(self, value):
+        gate, up, down, shared_gate = self.shared
+        shared = F.linear(F.silu(F.linear(value, gate)) * F.linear(value, up), down)
+        return shared * torch.sigmoid(F.linear(value, shared_gate))
+
     def __call__(self, hidden, token, history, position, cos, sin, rope_cos, rope_sin):
         if self.ple:
             hidden = hidden + self.ple(hidden, token, history)
@@ -297,20 +306,36 @@ class Layer:
         dist.all_reduce(output, group=self.attention_group)
         hidden = self.hc_attn.combine(output, residual)
         value, residual = self.hc_mlp.mix(hidden)
+        if self.shared_stream is not None:
+            current_stream = torch.cuda.current_stream(device=value.device)
+            self.shared_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.shared_stream):
+                shared = self._shared_expert(value)
         probabilities = F.softmax(F.linear(value, self.router).float(), -1)
         probabilities, ids = probabilities.topk(10, -1)
         probabilities, ids = ops.normalize_topk(probabilities, ids)
         output = self.experts(value, ids, probabilities)
-        if self.shared is not None:
-            gate, up, down, shared_gate = self.shared
-            shared = F.linear(F.silu(F.linear(value, gate)) * F.linear(value, up), down)
-            output = output + shared * torch.sigmoid(F.linear(value, shared_gate))
+        if self.shared_stream is not None:
+            current_stream.wait_stream(self.shared_stream)
+            output = output + shared
+        elif self.shared is not None:
+            output = output + self._shared_expert(value)
         dist.all_reduce(output)
         return self.hc_mlp.combine(output, residual)
 
 
 class Qwen38Runner:
-    def __init__(self, model, rank, world, capacity=4096, *, execution_limit=None, attention_tp=8):
+    def __init__(
+        self,
+        model,
+        rank,
+        world,
+        capacity=4096,
+        *,
+        execution_limit=None,
+        attention_tp=8,
+        shared_expert_stream=True,
+    ):
         attention_ranks, attention_rank = attention_layout(rank, world, attention_tp)
         if execution_limit is not None and (
             type(execution_limit) is not int or not 0 < execution_limit <= capacity
@@ -321,6 +346,9 @@ class Qwen38Runner:
         self.device = torch.device("cuda", rank)
         torch.cuda.set_device(self.device)
         self.rank, self.world, self.capacity = rank, world, capacity
+        self.shared_stream = (
+            torch.cuda.Stream(device=self.device) if rank == 0 and shared_expert_stream else None
+        )
         self.attention_tp = attention_tp
         self.attention_group = None
         if attention_tp < world:
@@ -352,9 +380,10 @@ class Qwen38Runner:
                     attention_tp,
                     attention_rank,
                     self.attention_group,
+                    self.shared_stream,
                 )
             )
-            # This runner executes one token on one stream; layers never overlap.
+            # Tokens are sequential even when the rank-0 shared expert uses a side stream.
             self.moe_workspace = self.layers[-1].experts.workspace
             if rank == 0:
                 print(f"loaded Qwen3.8 layer {index + 1}/48", flush=True)

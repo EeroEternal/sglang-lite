@@ -44,30 +44,29 @@ class QwenGpuOpsTests(unittest.TestCase):
             expected = (scores.softmax(-1) @ values).to(q.dtype)
             torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
 
-    def test_gdn_state_and_output(self):
+    def test_gdn_recurrence_state_and_output(self):
         q = torch.randn((2, 128), device="cuda", dtype=torch.bfloat16)
         k = torch.randn_like(q)
         v = torch.randn((6, 128), device="cuda", dtype=torch.bfloat16)
         z = torch.randn_like(v)
         a = torch.randn(6, device="cuda", dtype=torch.bfloat16)
         b = torch.randn_like(a)
+        beta = b.float().sigmoid().to(b.dtype)
         bias = torch.randn(6, device="cuda")
         log_a = torch.randn(6, device="cuda")
         norm = torch.randn(128, device="cuda", dtype=torch.bfloat16)
         state = torch.randn((6, 128, 128), device="cuda") * 0.1
-        qf = torch.nn.functional.normalize(q.float(), dim=-1, eps=1e-12)
-        kf = torch.nn.functional.normalize(k.float(), dim=-1, eps=1e-12)
+        qf = q.float() / torch.sqrt(q.float().square().sum(-1, keepdim=True) + 1e-6)
+        kf = k.float() / torch.sqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)
         qf, kf = qf.repeat_interleave(3, 0), kf.repeat_interleave(3, 0)
         decay = (-log_a.exp() * torch.nn.functional.softplus(a.float() + bias)).exp()
         expected_state = state * decay[:, None, None]
-        correction = (v.float() - (expected_state * kf[:, None, :]).sum(-1)) * b.float().sigmoid()[
-            :, None
-        ]
+        correction = (v.float() - (expected_state * kf[:, None, :]).sum(-1)) * beta.float()[:, None]
         expected_state = expected_state + correction[:, :, None] * kf[:, None, :]
         expected = ((expected_state * qf[:, None, :]).sum(-1) / (128**0.5)).to(v.dtype).float()
         expected = expected * torch.rsqrt(expected.square().mean(-1, keepdim=True) + 1e-6)
         expected = (expected * norm.float() * z.float().sigmoid()).to(v.dtype).reshape(1, -1)
-        actual = self.ops.gdn_update(q, k, v, z, b, a, bias, log_a, state, norm)
+        actual = self.ops.gdn_update(q, k, v, z, beta, a, bias, log_a, state, norm)
         torch.testing.assert_close(state, expected_state, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
@@ -111,6 +110,55 @@ class QwenGpuOpsTests(unittest.TestCase):
                 actual = self.ops.gdn_conv_sum(projected, history, weight)
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                 torch.testing.assert_close(history, window[:, 1:], atol=0, rtol=0)
+
+    def test_fused_conv_and_gate_preserve_rounding(self):
+        for channels in (1280, 2560, 5120):
+            history = torch.randn((channels, 3), device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn((channels, 4), device="cuda")
+            projected = torch.randn((1, channels), device="cuda", dtype=torch.bfloat16)
+            b = torch.randn((6,), device="cuda", dtype=torch.bfloat16) * 5
+            window = torch.cat([history.clone(), projected.reshape(-1, 1)], -1)
+            expected = (window.float() * weight).sum(-1)
+            conv, beta = self.ops.gdn_conv_sum(projected, history, weight, b)
+            torch.testing.assert_close(conv, expected, atol=0, rtol=0)
+            torch.testing.assert_close(history, window[:, 1:], atol=0, rtol=0)
+            torch.testing.assert_close(beta, b.float().sigmoid().to(b.dtype), atol=0, rtol=0)
+
+    def test_shared_expert_side_stream_graph_matches_serial(self):
+        from qwen38_runner.model import Layer
+
+        layer = object.__new__(Layer)
+        layer.shared = [
+            torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.01
+            for shape in ((640, 2560), (640, 2560), (2560, 640), (1, 2560))
+        ]
+        value = torch.randn((1, 2560), device="cuda", dtype=torch.bfloat16)
+        result = torch.empty_like(value)
+        side = torch.cuda.Stream()
+        main = torch.cuda.current_stream()
+        graph = torch.cuda.CUDAGraph()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            layer._shared_expert(value)
+        main.wait_stream(side)
+        torch.cuda.synchronize()
+        try:
+            with torch.cuda.graph(graph):
+                seed = value + 0
+                capture = torch.cuda.current_stream()
+                side.wait_stream(capture)
+                with torch.cuda.stream(side):
+                    shared = layer._shared_expert(seed)
+                capture.wait_stream(side)
+                result.copy_(shared + 0)
+            for _ in range(3):
+                sample = torch.randn_like(value)
+                value.copy_(sample)
+                graph.replay()
+                expected = layer._shared_expert(sample)
+                torch.testing.assert_close(result, expected, atol=0, rtol=0)
+        finally:
+            graph.reset()
 
     def test_cached_gemma_norm_scale_is_exact(self):
         for shape, group in [((3, 256), None), ((1, 128), None), ((1, 10240), 2560)]:
@@ -158,6 +206,25 @@ class QwenGpuOpsTests(unittest.TestCase):
                     .to(index_raw.dtype)
                 )
                 actual = self.ops.qsa_block_mean(index_raw, position)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_qsa_rope_preserves_bf16_rotation_and_remaining_channels(self):
+        for rows, width in ((1, 128), (4, 128), (1, 256), (3, 256), (6, 256), (12, 256)):
+            for seed in range(16):
+                angles = torch.randn((1, 32), device="cuda") * (seed + 1)
+                cos, sin = angles.cos(), angles.sin()
+                x = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16) * 3
+                first, second = x[:, :32].float(), x[:, 32:64].float()
+                expected = torch.cat(
+                    [
+                        torch.cat([first * cos - second * sin, second * cos + first * sin], -1).to(
+                            x.dtype
+                        ),
+                        x[:, 64:],
+                    ],
+                    -1,
+                )
+                actual = self.ops.rope(x, cos, sin)
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_bounded_dense_attention_matches_full_kernel_exactly(self):

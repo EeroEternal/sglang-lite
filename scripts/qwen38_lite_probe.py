@@ -58,6 +58,7 @@ def main():
     p.add_argument("--graph", action="store_true")
     p.add_argument("--capacity", type=int, default=4096)
     p.add_argument("--attention-tp", type=int, choices=(2, 4, 8), default=8)
+    p.add_argument("--serial-shared-expert", action="store_true", help="paired control")
     args = p.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -89,6 +90,7 @@ def main():
             "attention_dp": 1,
             "pp": 1,
             "shared_expert_rank": 0,
+            "shared_expert_stream": not args.serial_shared_expert,
         },
         "graph": args.graph,
         "capacity": args.capacity,
@@ -105,6 +107,7 @@ def main():
             args.capacity,
             execution_limit=len(ids) + required,
             attention_tp=args.attention_tp,
+            shared_expert_stream=not args.serial_shared_expert,
         )
         report["load_s"] = time.perf_counter() - load_start
         audit = tensor_audit(runner)

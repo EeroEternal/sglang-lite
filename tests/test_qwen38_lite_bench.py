@@ -1,8 +1,10 @@
 """Timing accounting tests without a Torch dependency."""
 
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / "scripts" / "qwen38_lite_bench.py"
 SPEC = importlib.util.spec_from_file_location("qwen38_lite_bench", PATH)
@@ -43,3 +45,15 @@ class LiteBenchmarkTests(unittest.TestCase):
     def test_short_output_is_not_a_speed_sample(self):
         with self.assertRaises(ValueError):
             BENCH.summarize([{"generation_s": 1.0, "decode_s": 0.5, "ids": [1], "text": "text"}], 2)
+
+    def test_all_rank_traces_require_profiling(self):
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["bench", "--model", "unused", "--out", "unused", "--profile-all-ranks"],
+            ),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            BENCH.main()
+        self.assertEqual(caught.exception.code, 2)

@@ -481,3 +481,223 @@ rank0 replay kernel 数 **14,528→14,240**，累计 kernel 时间
 `qwen38-owned-speed-qsa-mean-control-paired.json` 和
 `qwen38-owned-speed-qsa-mean-paired.json`（各有 `.trace.json`）；
 数值 artifact：`qwen38-owned-teacher-64-qsa-mean.json` 及八个 rank audit。
+
+## 10. 第 44 token 的 GDN gate 修正与成本（2026-10-04）
+
+在同一 prompt/token 前缀上捕获 SGLang 和 owned 的第 0 层中间张量：
+layer input 与 attention hyperconnection mix 逐位一致，最早可靠差异
+出现在 local GDN 输出（相对 RMS 约 0.00505）。上游 packed decode 核
+将 FP32 `sigmoid(b)` 舍入到 BF16 gate 后再用于 FP32 recurrent state；
+owned 原先直接使用 FP32 gate。只在 `torch.compile` 内添加
+BF16→FP32 cast 会被 Inductor 消去，GPU 测试确认其行为仍是未舍入。
+因此需要显式 BF16 tensor 边界；为避免额外启动一次 kernel，最终将
+gate 舍入并入原有 GDN convolution sum Triton kernel。测试对比
+FP32 convolution、BF16 history 和 BF16 sigmoid gate 的原表达式；
+真实权重 64-step teacher forcing 与独立 gate kernel 候选的输出 ID
+及每项 selected-token logprob **完全相等**。自由生成前 49 个 token
+与确定性参考一致，第 50 token 起仍分歧。
+
+原先零基索引 43 的第 44 token 错误选择 1204，修正后选择确定性
+SGLang 参考的 **69377**。但这不是完整数值修复：首次分歧移至零基
+索引 **49**（第 50 token），仍为 **63/64 top1**，最大 selected-token
+logprob 绝对误差约 **0.323413**；第 0 层 GDN 输出整体的参考差异
+未消失。预填充和 packed decode 的状态/舍入路径尚需继续定位，
+长上下文、QSA budget 边界和服务端验收均未通过。
+
+同机同权重单序列 runner、TP8/EP8/attention TP8，3 次 warm 的对照
+如下。原先 QSA 均值优化的旧快照与本轮测试不是严格交替的配对运行；
+仅比较紧邻的两个 gate 方案来判断额外 kernel 的影响。所有时间均含
+runner prefill/逐步生成，但不含 serving scheduler，不能直接对比
+SGLang 的 Engine.generate 请求端 KPI。
+
+| 输出数 | 旧 QSA 均值快照（秒） | 独立 gate kernel（秒） | gate 融合进 conv（秒） | 融合后 runner tok/s |
+|---:|---|---|---|---:|
+| 64 | 0.745340 / 0.745526 / 0.745586 | 0.772954 / 0.772457 / 0.772747 | 0.772867 / 0.772685 / 0.772153 | 82.83 |
+| 128 | 1.411011 / 1.393228 / 1.393009 | 1.445842 / 1.446461 / 1.444573 | 1.444695 / 1.405732 / 1.395677 | 91.06 |
+| 256 | 2.706863 / 2.707008 / 2.707331 | 2.713215 / 2.713795 / 2.713347 | 2.709625 / 2.709507 / 2.709283 | 94.48 |
+
+128-token 新方案的三次时长存在波动，不把中位数差当作稳定的提速。
+256-token 相比旧快照的 94.57 tok/s **没有可确认提升**。四次
+rank0 replay 的 profile kernel 数：旧 QSA 快照 14,240、
+独立 gate 14,384、融合后恢复到 14,240；对应 kernel 累计时间
+39.850/40.304/40.238 ms，不代表整请求时间。
+
+另试将 QSA 当前索引行写入与四行均值合并：叶子状态与 64-step
+teacher-forced ID/logprob 全部相等，但紧邻的 256-token runner
+只从 94.348 到 94.430 tok/s，短输出略慢，**已撤回**。
+在同一个编译图内用 FP32 位运算模拟 BF16 舍入的试验虽通过随机
+叶子测试，真实权重第 44 token 又分歧，**也已撤回**。
+不以 kernel 数下降或随机输入单测替代模型级正确性门禁。
+
+原始 artifact：`qwen38-owned-teacher-64-beta-boundary.json`、
+`qwen38-owned-teacher-64-beta-conv-fused.json`、
+`qwen38-owned-speed-beta-boundary.json`、
+`qwen38-owned-speed-beta-conv-fused.json` 及各 `.trace.json`；
+撤回试验为 `qwen38-owned-teacher-64-beta-qsa-fused.json` 和
+`qwen38-owned-teacher-64-beta-inline.json`。
+隔离八卡的 Qwen 聚焦 GPU/源码/benchmark/基线测试 **35 项通过**，
+本地 CPU 子集 **18 项通过**；Ruff 格式和 lint、`git diff --check`
+通过。真实权重自由生成 artifact：
+`qwen38-owned-free-64-beta-conv-fused.json`。没有进行服务端测速，
+也没有通过跨 QSA budget、状态复用和完整数值验收。
+
+## 11. Decode 时间归因与共享专家双 stream（2026-10-04）
+
+先拆开 elapsed time，避免将 rank0 的 kernel 总时长误当成请求时间。
+修正 GDN gate 后的 256-token runner 例子：单请求 warm 中位
+**2.709507 s**（94.48 tok/s），其中 255 次 decode replay 的
+CUDA event 中位 **2.599243 s**，即 **10.193 ms/step**；
+差约 **0.110 s**，还包含 11-token prefill、首 token、
+主机 tokenizer/输出读取等，不能全归于 prefill。该 runner 没有
+serving scheduler，也没有 HTTP 请求开销。
+
+同位置 rank0 四次 graph replay 的原 profile 有 **392 次**
+BF16 NCCL AllReduce，即 **98 次/token**，kernel 累计约
+8.08 ms / 四次 replay（约 20% 的 rank0 累计 kernel 时间）。
+同时存在约 1,932 次 GEMV kernel 和 384 次 NVFP4 routed-expert
+CUTLASS GEMM；因此仅消除 logits 通信不足以解决 decode 延迟。
+新增 benchmark 的 `--profile-all-ranks` 同时保存各 rank trace。
+该八卡 profile 中，rank0 比非共享专家 rank 多约 **480 个
+kernel/token**；但同时采集 profiler 明显扰动 NCCL 等待时间，
+不能把不同 rank 的累计 kernel 时间差换算成墙钟加速。
+
+保留所有 98 次/token AllReduce 和原有浮点运算顺序，仅让 rank0
+的 BF16 共享专家在独立 CUDA stream 上与 routed experts 并行，
+在两条分支使用同一个 `value` 前等待主 stream，合并前等待共享
+stream；只建一个 runner 级 side stream，48 层顺序复用。
+CUDA graph 多 stream 叶子测试与串行结果逐位相同；真实权重
+64-step teacher forcing 的 ID、每项 selected-token logprob
+与串行对照完全一致，三种长度的自由生成 ID 及各组 warm 重复
+也全部一致。默认 runner 启用双 stream；诊断脚本提供
+`--serial-shared-expert` 复测旧路径。
+
+同机同权重、8×5090、TP8/EP8/attention TP8、11-token prompt、
+每项三次 warm。先串行→双 stream，再反向双 stream→串行，
+两个顺序都先完整运行一遍冷启动；profile 均在测速之后才采集：
+
+| 次序/输出 | 串行三次 warm 秒 | 双 stream 三次 warm 秒 | 中位 runner tok/s（串行→双 stream） |
+|---|---|---|---:|
+| 正向/64 | 0.772897 / 0.772952 / 0.773473 | 0.735014 / 0.735226 / 0.735072 | 82.80→87.07 |
+| 正向/128 | 1.446266 / 1.446170 / 1.445860 | 1.375211 / 1.375181 / 1.375429 | 88.51→93.08 |
+| 正向/256 | 2.711878 / 2.710046 / 2.710137 | 2.564737 / 2.565191 / 2.564710 | 94.46→99.82 |
+| 反向/64 | 0.746113 / 0.746196 / 0.746304 | 0.705341 / 0.705411 / 0.705597 | 85.77→90.73 |
+| 反向/128 | 1.395462 / 1.395280 / 1.395383 | 1.319922 / 1.319873 / 1.320005 | 91.73→96.98 |
+| 反向/256 | 2.709440 / 2.709292 / 2.709828 | 2.562772 / 2.562293 / 2.563116 | 94.48→99.89 |
+
+256-token 纯 decode 分别由 **10.195→9.647 ms/step** 和
+**10.193→9.639 ms/step**，两个方向均改善约 0.55 ms/step，
+runner throughput 相对提升约 5.7%。64/128-token 两轮的绝对
+速度不同，故仅比较各轮紧邻对照，不混用最快单次结果。
+正向 rank0 profile 的 kernel 数均为 14,240，AllReduce 均为
+392 次；累计 kernel 时间甚至从 40.277 增至 43.110 ms，
+但四次 replay 的 rank0 观测跨度从约 46.275 降至 44.093 ms。
+这是**重叠执行**而非减少 kernel 或通信，GPU profile 不能代替
+上表的请求墙钟计时。
+
+输出尚在第 50 token 与确定性 SGLang 分歧，完整模型数值验收
+仍未通过；runner 99.89 tok/s 与 SGLang 曾有的 114.45 tok/s
+也不属于同口径服务 KPI，不能声称已追平标准服务。
+artifact：`qwen38-rank-profile-beta-conv-fused.rank*.trace.json`，
+`qwen38-shared-stream-{control-paired,paired,reverse-optimized,reverse-control}.json`
+及各 `.trace.json`；数值探针
+`qwen38-teacher-64-shared-stream.json`。默认双 stream 再次跑
+64-step teacher/free：teacher 与串行快照 ID/logprob 全相等，
+free 首次分歧仍在零基位置 49。远端聚焦 GPU/源码/benchmark/基线
+**37 项通过**，本地 CPU 子集 **19 项通过**；Ruff、格式和 diff
+检查通过，远端退出后八卡各 2 MiB。默认路径探针 artifact：
+`qwen38-shared-stream-default-{teacher,free}.json`。
+
+## 12. 第 50 token：GDN recurrent 输出顺序（2026-10-04）
+
+继续对照上游 SGLang packed-decode GDN 叶子核与 lite：用相同
+BF16 Q/K/V/gate、FP32 初态和权重进行 GPU 随机测试，旧的
+`torch.compile` 状态更新在 FP32 state 上仅有微小误差，但其
+BF16 recurrent 输出约四分之一元素不一致，足以在后续层改变
+接近的 logits。单独用相同输入测试 gated RMSNorm 后结果逐位
+一致，因此不能将该差异归因于输出 norm。
+
+将上游的 Q/K 归一化、gate/decay、按 32 个 value 通道切块的
+FP32 state 更新与缩放输出 reduction 顺序，收敛为 owned
+Triton GPU 叶子核；保留已验证的 BF16 gate 及共享专家双 stream。
+随机四组输入对上游 packed-decode kernel 的 FP32 最终 state、
+BF16 输出和 gated norm 结果**逐位一致**；上游仅用于隔离
+测试，不成为 lite runtime 依赖。对应源码来源、Apache-2.0
+和 commit 见 [QWEN38_SOURCES.md](vendor/QWEN38_SOURCES.md)。
+
+在原 11-token prompt、确定性 SGLang 64-token 参考上，真实权重
+CUDA graph 的 teacher forcing **64/64 top1**；自由生成
+**64/64 token ID 完全一致**，包含此前分歧的第 50 个 token。
+selected-token logprob 最大绝对误差仍为 **0.144327**，不等于
+全模型逐位相等。另用相同确定性设置重新生成 128-token
+SGLang 参考，其前 64 token 与原 golden 完全一致；
+128-token teacher forcing **128/128 top1**，自由生成
+**128/128 token ID**，但最大 selected-token logprob 绝对
+误差约 **0.274001**。这仍只是同一个 prompt，当前还没有
+验证其他 prompt、长上下文、
+跨 QSA budget、状态恢复/复用与 serving；不能将单 prompt
+通过等同完整正确性验收。
+
+开启 rank0 共享专家双 stream 后，新算子的 runner
+64/128/256-token warm 原始时长分别为
+**0.734714/0.736235/0.735101**、
+**1.374729/1.374645/1.375295**、
+**2.584553/2.566968/2.567697** 秒；中位
+**87.06/93.11/99.70 tok/s**。此前同配置的中位为
+**87.07/93.08/99.82 tok/s**，没有可确认的加速或减速；
+256-token 有一次偏慢样本，不隐去。runner 与标准
+SGLang Engine.generate 的请求端仍不是同口径 KPI。
+
+隔离 artifact：`qwen38-reference-recurrence-teacher64.json`、
+`qwen38-reference-recurrence-free64.json`、
+`qwen38-reference-recurrence-speed.json` 及 `.trace.json`、
+`qwen38-diagnostic-128-triton.json`、
+`qwen38-clean-recurrence-{teacher128,free128}.json`。
+清理旧 GDN 实现后，隔离八卡 GPU/源码/benchmark/基线聚焦回归
+**37 项通过**；本地 CPU 子集 **19 项通过**。参考引擎首次临时
+诊断尝试因脚本使用标准输入，随后因遗漏多进程 main guard 而
+启动失败；改为带 main guard 的远端隔离脚本后成功生成 128-token
+参考且退出释放全部 GPU。代码无需也没有依赖这些远端脚本。
+
+## 13. QSA 单 token RoPE 融合（2026-10-04）
+
+在通过 128-token 数值对照的 GDN 版本上继续只做速度优化。
+QSA 每步对 BF16 query/key 和 compressed index key 旋转 32+32
+维；旧表达式以 FP32 分段乘加、BF16 舍入，再拼回未旋转通道，
+每次需要多个 Torch launch/concat。改为一个 owned Triton kernel，
+禁用 FMA 融合以保留乘法、加减和 BF16 舍入次序；未旋转通道
+直接复制。默认 TP8 及备选 attention TP4/TP2 的 1/3/4/6/12 行
+叶子形状逐位匹配旧表达式。真实权重 128-token graph teacher
+forcing 的所有 ID 和每项 selected-token logprob 与旧 runner
+**完全相等**，自由生成仍与确定性参考 **128/128 ID** 相等。
+
+只交换 RoPE 算子，其他代码、权重、并行结构、prompt、11-token
+prefill 和 `--profile` 设置不变。每次先 cold 再三次 warm，
+先串行旧 RoPE→融合 RoPE，再融合→旧 RoPE：
+
+| 次序/长度 | 旧 RoPE 三次 warm 秒 | 融合 RoPE 三次 warm 秒 | runner 中位 tok/s（旧→新） |
+|---|---|---|---:|
+| 正向/64 | 0.735713 / 0.735815 / 0.735505 | 0.684299 / 0.684944 / 0.685229 | 86.99→93.44 |
+| 正向/128 | 1.375109 / 1.375113 / 1.375525 | 1.281426 / 1.316721 / 1.333820 | 93.08→97.21 |
+| 正向/256 | 2.565423 / 2.565757 / 2.566307 | 2.528245 / 2.489118 / 2.488527 | 99.78→102.85 |
+| 反向/64 | 0.707277 / 0.707232 / 0.707312 | 0.713355 / 0.713490 / 0.713597 | 90.49→89.70 |
+| 反向/128 | 1.323061 / 1.323031 / 1.322847 | 1.333826 / 1.333891 / 1.333453 | 96.75→95.96 |
+| 反向/256 | 2.569036 / 2.567934 / 2.567773 | 2.486797 / 2.486916 / 2.486564 | 99.69→102.94 |
+
+256-token 两个方向均约提升 **3%**，decode GPU event
+**9.650→9.362 ms/step** 与 **9.658→9.352 ms/step**。
+64/128-token 在反向测试并不更快，**不能将正向短输出收益宣称为
+稳定结论**。相同位置四次 replay 的 rank0 kernel 数
+**13,952→12,512**，其中融合 RoPE 运行 144 次；
+kernel 累计时间正向约 **43.008→41.900 ms**，
+反向 **42.986→41.865 ms**；它不等于请求墙钟。
+输出长度的每组三次 warm ID 都相等，两个版本的输出 ID 逐项
+相等。这仍是**单序列 runner generation**，没有 serving scheduler，
+不能与 SGLang Engine.generate 数字当作等口径 KPI。
+
+原始 artifact：
+`qwen38-rope-{control-paired,fused-paired,reverse-fused,reverse-control}.json`
+及各 `.trace.json`；
+`qwen38-rope-fused-{teacher128,free128}.json`。
+远端 Qwen 聚焦 GPU/源码/benchmark/基线 **38 项通过**，
+本地 CPU 子集 **19 项通过**，结束后八卡各 2 MiB。
+其他 prompt、超过 QSA budget 的路径、状态复用与实际服务仍未验收。
