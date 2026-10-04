@@ -133,13 +133,7 @@ class QSA:
         index_qk = F.linear(value, self.i_proj).reshape(5, 128)
         self.index_raw.index_copy_(0, position, index_qk[4:])
         block = position // 4
-        slots = block * 4 + self.slot_offsets
-        raw = (
-            self.index_raw.index_select(0, slots.clamp_max(self.capacity - 1))
-            .float()
-            .mean(0, keepdim=True)
-            .to(value.dtype)
-        )
+        raw = ops.qsa_block_mean(self.index_raw, position)
         normalized = ops.rms(raw, self.iknorm, gemma=False)
         block_start = block * 4
         compressed = ops.rope(

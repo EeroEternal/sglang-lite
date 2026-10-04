@@ -440,3 +440,44 @@ ID 一致；64-step teacher-forced 的 ID 和每项 selected-token logprob
 拓扑对照：`qwen38-owned-speed-attntp2.json`、
 `qwen38-owned-speed-attntp4.json`、
 `qwen38-sglang-refresh-attndp{1,2,4}.json`。
+
+## 9. QSA 压缩索引四行均值融合（2026-10-04）
+
+前一轮提交 `f074b36` 后继续缩减 QSA 的小算子：对 GPU `index_raw` 的
+相邻四行做 FP32 均值并转 BF16，取代每层每步的
+`arange → clamp → index_select → float → mean → BF16`。
+位置和缓存仍在 GPU，四行未写入的值仍按原逻辑从已有状态读取；
+compressed index 每四 token 写一次的条件和 dense/sparse 边界不变。
+叶子测试对照原表达式的多个块起止及容量末端；真实权重的 64-step
+teacher forcing 与改动前的 ID、每项 selected-token logprob 完全一致。
+既有 **63/64 top1、第 44 token 分歧**仍未解决。
+
+拒绝的候选：将 dense attention 的 Triton block 32 改为 64 虽缩短单核
+时长，但 1008 组随机输入有 96 组不逐位一致，未修改默认内核。
+
+在同一远端、同一权重、TP8/EP8/attention TP8、4096 KV capacity、
+相同 prompt、三次 warm 的连续“旧实现→新实现”对照如下。
+两边均启用 profile，仅在测速完成后采集四次 replay；这是**单序列
+runner generation**，不包含 serving scheduler，不能与 SGLang 服务端
+端到端请求直接对比：
+
+| 输出数 | 旧实现原始 warm 秒 | 新实现原始 warm 秒 | runner 中位 tok/s（旧→新） |
+|---:|---|---|---:|
+| 64 | 0.780795 / 0.781341 / 0.781912 | 0.745340 / 0.745526 / 0.745586 | 81.91→85.85 |
+| 128 | 1.461035 / 1.460818 / 1.436580 | 1.411011 / 1.393228 / 1.393009 | 87.62→91.87 |
+| 256 | 2.739483 / 2.739447 / 2.739231 | 2.706863 / 2.707008 / 2.707331 | 93.45→94.57 |
+
+128-token 的旧实现一次样本较快，不隐去；独立于配对测试的首次新实现
+256-token 中位为 94.62 tok/s，结论不依赖该单次较快样本。三组输出
+ID 全部逐项相等，各自 warm 重复 ID 一致。相同 profile 位置的四次
+rank0 replay kernel 数 **14,528→14,240**，累计 kernel 时间
+**40.354→39.850 ms**；这不是整请求墙钟。
+
+新增 GPU 叶子回归后远端聚焦测试 **34 项通过**，本地 CPU 子集
+**18 项通过**；八卡持久张量审计均为 CUDA，rank0 1,676、其余各
+1,484。结束时各卡 2 MiB。长上下文、跨 QSA budget、状态恢复与
+服务端正确性仍未验收；前述确定性 SGLang 数值差异未修复。
+配对原始 artifact：
+`qwen38-owned-speed-qsa-mean-control-paired.json` 和
+`qwen38-owned-speed-qsa-mean-paired.json`（各有 `.trace.json`）；
+数值 artifact：`qwen38-owned-teacher-64-qsa-mean.json` 及八个 rank audit。

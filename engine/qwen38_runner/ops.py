@@ -165,6 +165,34 @@ def store_qsa_compressed(compressed, position, value):
 
 
 @triton.jit
+def _qsa_block_mean(index_raw, position, output, CAPACITY: tl.constexpr):
+    columns = tl.arange(0, 128)
+    block = (tl.load(position) // 4) * 4
+    a = tl.load(index_raw + tl.minimum(block, CAPACITY - 1) * 128 + columns).to(tl.float32)
+    b = tl.load(index_raw + tl.minimum(block + 1, CAPACITY - 1) * 128 + columns).to(tl.float32)
+    c = tl.load(index_raw + tl.minimum(block + 2, CAPACITY - 1) * 128 + columns).to(tl.float32)
+    d = tl.load(index_raw + tl.minimum(block + 3, CAPACITY - 1) * 128 + columns).to(tl.float32)
+    tl.store(output + columns, ((a + b) + (c + d)) * 0.25)
+
+
+def qsa_block_mean(index_raw, position):
+    if (
+        index_raw.ndim != 2
+        or index_raw.shape[1] != 128
+        or index_raw.shape[0] % 4
+        or index_raw.dtype != torch.bfloat16
+        or position.shape != (1,)
+        or not all(t.is_cuda and t.is_contiguous() for t in (index_raw, position))
+    ):
+        raise ValueError("QSA block mean requires aligned contiguous CUDA BF16 index state")
+    output = torch.empty((1, 128), device=index_raw.device, dtype=index_raw.dtype)
+    _qsa_block_mean[(1,)](
+        index_raw, position, output, index_raw.shape[0], num_warps=4, enable_fp_fusion=False
+    )
+    return output
+
+
+@triton.jit
 def _table_lookup(
     table,
     ids,

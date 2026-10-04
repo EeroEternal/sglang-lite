@@ -145,6 +145,21 @@ class QwenGpuOpsTests(unittest.TestCase):
             self.ops.store_qsa_compressed(actual, position, value)
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
+    def test_qsa_block_mean_matches_original_four_row_mean(self):
+        for capacity in (8, 512):
+            index_raw = torch.randn((capacity, 128), device="cuda", dtype=torch.bfloat16)
+            for pos in (0, 1, 3, 4, 7, capacity - 4, capacity - 1):
+                position = torch.tensor([pos], device="cuda")
+                slots = (position // 4) * 4 + torch.arange(4, device="cuda")
+                expected = (
+                    index_raw.index_select(0, slots.clamp_max(capacity - 1))
+                    .float()
+                    .mean(0, keepdim=True)
+                    .to(index_raw.dtype)
+                )
+                actual = self.ops.qsa_block_mean(index_raw, position)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
     def test_bounded_dense_attention_matches_full_kernel_exactly(self):
         q = torch.randn((3, 256), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
