@@ -276,6 +276,22 @@ class QwenGpuOpsTests(unittest.TestCase):
                 actual = self.ops.rope(x, cos, sin)
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
+    def test_qsa_fused_rope_and_kv_write_preserves_all_state(self):
+        keys = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
+        values = torch.randn_like(keys)
+        expected_keys, expected_values = keys.clone(), values.clone()
+        for pos in (0, 1, 3, 7, 63, 127):
+            position = torch.tensor([pos], device="cuda", dtype=torch.int64)
+            k = torch.randn((1, 256), device="cuda", dtype=torch.bfloat16)
+            v = torch.randn_like(k)
+            angles = torch.randn((1, 32), device="cuda")
+            cos, sin = angles.cos(), angles.sin()
+            expected_keys.index_copy_(0, position, self.ops.rope(k, cos, sin))
+            expected_values.index_copy_(0, position, v)
+            self.ops.store_qsa_kv(k, v, cos, sin, keys, values, position)
+            torch.testing.assert_close(keys, expected_keys, atol=0, rtol=0)
+            torch.testing.assert_close(values, expected_values, atol=0, rtol=0)
+
     def test_bounded_dense_attention_matches_full_kernel_exactly(self):
         q = torch.randn((3, 256), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)

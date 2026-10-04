@@ -853,3 +853,54 @@ graph teacher forcing **所有 ID 和 selected-token logprob**
 进程退出后八卡各 2 MiB。仍只验证单 prompt、
 短上下文与单序列 runner；跨 QSA budget、更多 prompt、
 状态复用和请求端同口径 KPI 未验收。
+
+## 17. QSA K/V RoPE 与缓存写入合核（2026-10-04）
+
+在第 16 节已提交的 QSA K/V GEMV 打包版本上，进一步消除
+每个 QSA 层的 K 旋转后独立 `index_copy_` 和 V 的
+`index_copy_`：一个 owned Triton kernel 按原 FP32
+乘减/乘加及 BF16 舍入次序将 K 写到 GPU cache 当前行，
+并复制 V 到另一块 cache 的当前行。保留既有通用 RoPE
+kernel 给 Q 与 compressed index 使用。QSA 位置保持
+GPU tensor，核内检查容量边界；未改 attention 计算、
+AllReduce 或 KV 生命周期。
+
+叶子测试在多个 cache 位置逐位检查 **全部 K/V 状态**
+与旧 RoPE→两次 index_copy 结果；真实权重 128-token
+graph teacher/free 的 ID 与**每项 selected-token logprob**
+分别与已提交版本完全相等，仍为确定性参考 **128/128 ID**。
+另筛选 GDN QKV/Z 与 QSA query/index 的同输入 GEMV
+合并：128 组随机 BF16 输入各出现 **25/12 项不一致**，
+均未加入实现。
+
+同机同权重、11-token prompt、TP8/EP8/attention TP8、
+4096 capacity、默认 NCCL、相同 `--profile`，
+每次 cold 后三次 warm；依次旧版→合核、反向合核→旧版：
+
+| 次序/长度 | 旧版三次 warm 秒 | 合核三次 warm 秒 | runner 中位 tok/s（旧→新） |
+|---|---|---|---:|
+| 正向/64 | 0.696811 / 0.696922 / 0.696792 | 0.668080 / 0.668652 / 0.673517 | 91.85→95.72 |
+| 正向/128 | 1.283328 / 1.253169 / 1.252484 | 1.302421 / 1.302042 / 1.302378 | 102.14→98.28 |
+| 正向/256 | 2.433976 / 2.433480 / 2.433087 | 2.428402 / 2.427879 / 2.428335 | 105.20→105.42 |
+| 反向/64 | 0.669834 / 0.670034 / 0.670152 | 0.668068 / 0.668514 / 0.668338 | 95.52→95.76 |
+| 反向/128 | 1.253740 / 1.253661 / 1.253840 | 1.250255 / 1.249856 / 1.249739 | 102.09→102.41 |
+| 反向/256 | 2.434619 / 2.434504 / 2.434192 | 2.428552 / 2.428391 / 2.428299 | 105.16→105.42 |
+
+256-token 两轮约 **+0.22%**，decode GPU event
+**9.152→9.132** 与 **9.155→9.133 ms/step**。
+rank0 四次 replay kernel 数 **12,032→11,936**，
+每次少 24 个启动；累计 kernel 时间正向
+**41.272→41.058 ms**、反向 **41.161→41.073 ms**，
+并非可直接扣除的请求时长。正向 128-token 合核
+**明显更慢**，不能以反向较快样本声称稳定短输出收益。
+所有长度旧/新版生成 ID 和三次 warm 的重复 ID 相同。
+AllReduce 保持每 token 98 次；本阶段仍仅为单序列 runner，
+不是 SGLang Engine.generate 同口径服务 KPI。
+
+原始 artifact：
+`qwen38-qsa-kv-write-{control-paired,candidate-paired,reverse-candidate,reverse-control}.json`
+及各 `.trace.json`，
+`qwen38-qsa-kv-write-fused-{teacher128,free128}.json`。
+远端八卡 GPU/源码/benchmark/基线聚焦回归 **42 项通过**，
+进程退出后各卡 2 MiB；仅同一个短 prompt，跨 QSA
+budget、更多 prompt、恢复复用和实际服务未验收。

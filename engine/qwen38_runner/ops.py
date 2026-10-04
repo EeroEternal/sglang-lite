@@ -350,6 +350,64 @@ def rope(x, cos, sin):
 
 
 @triton.jit
+def _store_qsa_kv(k, v, cos, sin, keys, values, position, CAPACITY: tl.constexpr):
+    token = tl.load(position)
+    tl.device_assert(token >= 0, "negative QSA position")
+    tl.device_assert(token < CAPACITY, "QSA position outside cache")
+    columns = tl.arange(0, 32)
+    first = tl.load(k + columns).to(tl.float32)
+    second = tl.load(k + 32 + columns).to(tl.float32)
+    angle_cos = tl.load(cos + columns)
+    angle_sin = tl.load(sin + columns)
+    tl.store(keys + token * 256 + columns, first * angle_cos - second * angle_sin)
+    tl.store(keys + token * 256 + 32 + columns, second * angle_cos + first * angle_sin)
+    tail = tl.arange(0, 256)
+    tl.store(
+        keys + token * 256 + tail,
+        tl.load(k + tail),
+        mask=tail >= 64,
+    )
+    tl.store(values + token * 256 + tail, tl.load(v + tail))
+
+
+def store_qsa_kv(k, v, cos, sin, keys, values, position):
+    if (
+        k.shape != (1, 256)
+        or v.shape != k.shape
+        or keys.ndim != 2
+        or keys.shape != values.shape
+        or keys.shape[1] != 256
+        or keys.dtype != torch.bfloat16
+        or values.dtype != keys.dtype
+        or v.dtype != keys.dtype
+        or k.dtype != keys.dtype
+        or cos.shape != (1, 32)
+        or sin.shape != cos.shape
+        or cos.dtype != torch.float32
+        or sin.dtype != cos.dtype
+        or position.shape != (1,)
+        or position.dtype != torch.int64
+        or not all(
+            t.is_cuda and t.is_contiguous() for t in (k, v, cos, sin, keys, values, position)
+        )
+    ):
+        raise ValueError("QSA K/V write requires contiguous CUDA BF16 rows and FP32 position angle")
+    _store_qsa_kv[(1,)](
+        k,
+        v,
+        cos,
+        sin,
+        keys,
+        values,
+        position,
+        keys.shape[0],
+        num_warps=1,
+        enable_fp_fusion=False,
+        debug=True,
+    )
+
+
+@triton.jit
 def _attention(
     q,
     keys,

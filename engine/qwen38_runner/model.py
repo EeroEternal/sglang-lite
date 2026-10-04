@@ -137,9 +137,15 @@ class QSA:
         q, gate = q_gate.chunk(2, -1)
         q = ops.rope(ops.rms(q, self.qnorm, gemma=False), cos, sin)
         k_raw, v = F.linear(value, self.kv).chunk(2, -1)
-        k = ops.rope(ops.rms(k_raw, self.knorm, gemma=False), cos, sin)
-        self.keys.index_copy_(0, position, k)
-        self.values.index_copy_(0, position, v)
+        ops.store_qsa_kv(
+            ops.rms(k_raw, self.knorm, gemma=False),
+            v,
+            cos,
+            sin,
+            self.keys,
+            self.values,
+            position,
+        )
         index_qk = F.linear(value, self.i_proj).reshape(5, 128)
         self.index_raw.index_copy_(0, position, index_qk[4:])
         block = position // 4
