@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 def rms(x, weight, eps=1e-6, group=None, gemma=True):
@@ -109,6 +110,7 @@ def _gdn_conv_sum(
     CHANNELS: tl.constexpr,
     BLOCK: tl.constexpr,
     WITH_BETA: tl.constexpr,
+    ACTIVATE: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = rows < CHANNELS
@@ -122,6 +124,8 @@ def _gdn_conv_sum(
     w3 = tl.load(weight + rows * 4 + 3, mask=valid, other=0)
     # Match ATen's four-tap shuffle reduction, with separately rounded products.
     result = (h0 * w0 + h2 * w2) + (h1 * w1 + value * w3)
+    if ACTIVATE:
+        result = tl.div_rn(result, 1.0 + libdevice.exp(-result))
     tl.store(output + rows, result, mask=valid)
     tl.store(history + rows * 3, h1, mask=valid)
     tl.store(history + rows * 3 + 1, h2, mask=valid)
@@ -132,7 +136,7 @@ def _gdn_conv_sum(
         tl.store(beta + heads, tl.sigmoid(gate), mask=heads < 6)
 
 
-def gdn_conv_sum(projected, history, weight, b=None):
+def _gdn_conv(projected, history, weight, b, activate):
     channels = history.shape[0]
     if (
         history.shape != (channels, 3)
@@ -149,7 +153,11 @@ def gdn_conv_sum(projected, history, weight, b=None):
         b.shape != (6,) or b.dtype != torch.bfloat16 or not b.is_cuda or not b.is_contiguous()
     ):
         raise ValueError("GDN gate requires six contiguous CUDA BF16 heads")
-    output = torch.empty(channels, device=projected.device, dtype=torch.float32)
+    output = torch.empty(
+        channels,
+        device=projected.device,
+        dtype=torch.bfloat16 if activate else torch.float32,
+    )
     beta = torch.empty_like(b) if b is not None else output
     _gdn_conv_sum[(triton.cdiv(channels, 256),)](
         projected,
@@ -161,9 +169,20 @@ def gdn_conv_sum(projected, history, weight, b=None):
         channels,
         256,
         b is not None,
+        activate,
         enable_fp_fusion=False,
     )
     return (output, beta) if b is not None else output
+
+
+def gdn_conv_sum(projected, history, weight, b=None):
+    return _gdn_conv(projected, history, weight, b, False)
+
+
+def gdn_conv_activated(projected, history, weight, b):
+    if b is None:
+        raise ValueError("activated GDN conv requires a BF16 gate")
+    return _gdn_conv(projected, history, weight, b, True)
 
 
 @triton.jit

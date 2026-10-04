@@ -74,8 +74,7 @@ class GDN:
     def __call__(self, value):
         b = F.linear(value, self.b).flatten()
         projected = F.linear(value, self.input)
-        conv_sum, beta = ops.gdn_conv_sum(projected, self.history, self.conv, b)
-        conv = F.silu(conv_sum).to(value.dtype)
+        conv, beta = ops.gdn_conv_activated(projected, self.history, self.conv, b)
         q, k, v = conv.split([self.keys * 128, self.keys * 128, self.values * 128])
         output = ops.gdn_update(
             q.reshape(-1, 128),

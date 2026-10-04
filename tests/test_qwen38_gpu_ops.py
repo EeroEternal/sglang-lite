@@ -124,6 +124,24 @@ class QwenGpuOpsTests(unittest.TestCase):
             torch.testing.assert_close(history, window[:, 1:], atol=0, rtol=0)
             torch.testing.assert_close(beta, b.float().sigmoid().to(b.dtype), atol=0, rtol=0)
 
+    def test_fused_conv_activation_preserves_bf16_and_state(self):
+        for channels in (1280, 2560, 5120):
+            history = torch.randn((channels, 3), device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn((channels, 4), device="cuda")
+            for seed in range(16):
+                projected = torch.randn((1, channels), device="cuda", dtype=torch.bfloat16) * (
+                    seed + 1
+                )
+                b = torch.randn((6,), device="cuda", dtype=torch.bfloat16)
+                window = torch.cat([history.clone(), projected.reshape(-1, 1)], -1)
+                expected = torch.nn.functional.silu((window.float() * weight).sum(-1)).to(
+                    projected.dtype
+                )
+                activated, beta = self.ops.gdn_conv_activated(projected, history, weight, b)
+                torch.testing.assert_close(activated, expected, atol=0, rtol=0)
+                torch.testing.assert_close(history, window[:, 1:], atol=0, rtol=0)
+                torch.testing.assert_close(beta, b.float().sigmoid().to(b.dtype), atol=0, rtol=0)
+
     def test_shared_expert_side_stream_graph_matches_serial(self):
         from qwen38_runner.model import Layer
 

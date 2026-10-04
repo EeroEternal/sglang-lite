@@ -50,8 +50,10 @@ Strata 仅提供 GPU GEMV、expert reduction、GPU token 选择、减少设备�
    的 64/128-token 自由生成 ID 与各自确定性参考完全一致；
    teacher-forcing top1 分别为 64/64 和 128/128，但最大所选 token
    logprob 误差分别仍约 0.144327 和 0.274001。
-   QSA RoPE 融合后的单序列 runner 在两轮配对的 256-token warm
-   约为 102.85/102.94 tok/s，不含 serving scheduler，不能与 SGLang 的 Engine.generate
+   再合并 GDN 卷积和 SiLU 后，单序列 runner 在两轮配对的
+   256-token warm 约为 103.69/103.73 tok/s（相比紧邻版本
+   的 102.98/102.94）；64/128-token 提速不稳定。不含 serving
+   scheduler，不能与 SGLang 的 Engine.generate
    直接当作等口径请求 KPI。**完整正确性、其他 prompt、长上下文/状态复用
    和服务端吞吐尚未验收**。来源见
    [QWEN38_SOURCES.md](vendor/QWEN38_SOURCES.md)。
