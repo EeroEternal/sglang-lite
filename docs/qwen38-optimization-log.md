@@ -904,3 +904,249 @@ AllReduce 保持每 token 98 次；本阶段仍仅为单序列 runner，
 远端八卡 GPU/源码/benchmark/基线聚焦回归 **42 项通过**，
 进程退出后各卡 2 MiB；仅同一个短 prompt，跨 QSA
 budget、更多 prompt、恢复复用和实际服务未验收。
+
+## 18. 长 QSA、MoE top-k 与 AllReduce 筛选（2026-10-05）
+
+仍在已提交的 `a63545b` runner 上做隔离实验，除了长上下文
+GPU 叶子回归外，**不保留性能候选代码**。以下 runner 计时
+不能和 SGLang 请求路径 KPI 混用。
+
+### 2100-token QSA 稀疏路径
+
+相同 11-token prompt、4096 capacity、TP8/EP8、默认 NCCL。
+SGLang 确定性模式、Triton MM、关闭 DeepGEMM 的两次
+`max_new_tokens=2100` 请求的 **2100 个 ID 完全一致**；
+但 selected-token logprob 自输出索引 2041 起有 **59/2100
+项不相等**，最大差异 **0.238489**。因此该参考本身
+不能充当逐项浮点完全一致的长上下文 golden。
+
+lite 的 2100-token graph teacher forcing 与自由生成均在
+输出索引 **128** 首次偏离 SGLang ID，早于 2048 预算
+边界；teacher 匹配 **1916/2100**，自由生成匹配
+**1693/2100**。teacher 相对第一次参考的最大
+selected-token logprob 误差为 **1.897679**；不能以
+后续边界附近多数 ID 相同代替数值验收。现有短上下文
+128/128 结果只覆盖输出索引 0–127。新增 GPU 叶子回归
+在位置 2047、2048、2050 核对 dense→selected attention
+切换及 pending block，均通过；它不能证明整个真实权重
+QSA 长路径正确。
+
+2100-token runner 一次 cold 后两次 warm，含 prefill 的
+墙钟 **23.265097 / 23.269597 s**；N-1 步 GPU decode
+event **23.156512 / 23.161709 s**，中位约
+**90.63 decode tok/s**，重复生成 ID 相同。
+`qsa_execution_limit=2115`，rank0 四次 graph replay
+从位置 2110 起取 trace：48 次 `_attention` kernel 累计
+**10.599 ms**、392 次 AllReduce **8.956 ms**、
+240 次 Torch top-k gather **1.891 ms**
+（包含 QSA 与 MoE），全体 GPU kernel 累计
+**53.362 ms**。这些累计值不是 2100-token 墙钟占比。
+原始 artifact：
+`qwen38-reference-2100-deterministic.json`、
+`qwen38-long-2100-{teacher,free}.json`、
+`qwen38-sparse-2100-baseline.json` 及其 `.trace.json`。
+
+### MoE 路由单核候选，不保留
+
+隔离 Triton 原型将 512 个 router FP32 score 的 softmax、
+top-10 和归一化并为单核，模拟原算子后与 Torch 对照。
+100 组随机 FP32 输入的专家 ID 相同，但 **514/1000**
+权重项不逐位相等，最大误差约 `4.47e-8`。
+100 组由 BF16 舍入的 score 中 **29 组 ID 顺序不同**、
+**506/1000** 权重项不相等；全并列值的 100 组
+全部 ID 顺序不同。Torch GPU top-k 对并列值并不按
+下标升序取值；即使近似权重看似很小，也不能把该核
+接入 MoE。数值门槛已失败，不进行真实权重或性能宣称。
+原始原型与输出：`qwen38-topk-experiment.py`（远端
+`results/` 内，未进入 runner）。
+
+### NCCL 参数候选，不保留
+
+仅试保持默认 ring/LL 的 `NCCL_NTHREADS=128` 以及
+`NCCL_MIN_NCHANNELS=2`、`NCCL_MAX_NCHANNELS=2`；
+**未**重试先前失败的 Tree、LL128 或 Simple。
+两候选各自的 128-token teacher 对默认配置均有
+**128/128 相同 ID、128/128 完全相同 selected-token
+logprob**。每组 256-token、三次（线程数）或两次
+（通道数）warm，以默认→候选和候选→默认双向运行；
+下面为 N-1 步 GPU decode event 原始秒数：
+
+| 次序 | 默认 NCCL | NCCL_NTHREADS=128 |
+|---|---|---|
+| 正向 | 2.329015 / 2.328721 / 2.328649 | 2.426052 / 2.426076 / 2.359901 |
+| 反向 | 2.425148 / 2.425384 / 2.330375 | 2.329273 / 2.328932 / 2.328357 |
+
+| 次序 | 默认 NCCL | 两通道 |
+|---|---|---|
+| 正向 | 2.425816 / 2.425992 | 2.425906 / 2.425934 |
+| 反向 | 2.427203 / 2.331832 | 2.425348 / 2.394258 |
+
+同组生成 ID 完全相同，四次 replay 都仍是
+**392 个 AllReduce**。线程数实验中双方的
+AllReduce kernel 累计约 **8.88–8.93 ms**，
+谁先运行谁快的现象跨方向反转；通道数实验的默认
+第一次 trace 为 **10.321 ms**，另三次约
+**8.88–8.91 ms**。连接一度超时，但远端四组 JSON、
+trace 完整且无运行错误，八卡随后空闲。这两种调参
+均未证明稳定收益，不保留，不声称解决 98 次/token
+的通信瓶颈。原始 artifact：
+`qwen38-nccl-{default,nthreads128,channels2}-teacher128.json`、
+`qwen38-nccl-{forward,reverse}-{default,nthreads128}.json`、
+`qwen38-nccl-2ch-{forward,reverse}-{default,channels2}.json`
+及对应 `.trace.json`。
+
+## 19. 第 129 个输出的数值诊断（2026-10-05，未修复）
+
+固定 11-token prompt、第 129 个输出（零基索引 128）：
+SGLang 的 140-token 和 2100-token 确定性参考前缀完全一致，
+选 **1061**，第二名 **271**，logit 差 **0.625**；
+关闭 SGLang CUDA graph 仍逐项一致。lite 分别用
+`execution_limit=151`（dense QSA）和 2111（长执行范围）
+做 140-token teacher forcing，前 140 项 ID/selected-token
+logprob 彼此逐项相等，都在索引 **128** 首次选错为
+**271**。自由生成也在此处分歧。因此不能将此问题归于
+2048 QSA 稀疏边界或 graph replay。
+
+在索引 128 的输入位置 138，逐层抓取两边 rank0 张量：
+第 0 层输入和进入 GDN 的 2560 维输入逐位相同；
+第 0 层本地 GDN 输出已有 **1404/2560** 项 BF16
+差异、RMS 误差约 **9.21e-5**；到第 47 层的
+10240 维输出 RMS 误差约 **0.10705**。QKVZ
+权重逐项一致，同一输入的投影相差 **4/2048**
+个 BF16 值；B/A 投影完全一致。用上游
+recurrent raw + Z 喂给 lite 的 gated norm/output
+projection，输出仅差 **1/2560** 项，可把部分差异
+定位到更早的计算。
+
+在首次 decode 的位置 11，SGLang 的提示词经过批量
+prefill，而 lite 逐 token 执行：进入第 0 层 GDN 的
+输入已逐位相等，但 **GDN temporal state**
+有 **98302/98304** 个 FP32 值不等（RMS 误差
+**0.00014037**），conv 历史 **798/3840**
+个 BF16 值不等。这表明问题早于第 129 个输出。
+仅在隔离诊断进程把所有 rank/所有 36 个 GDN 层的
+SGLang prefill 状态注入 lite，并不能单独修好：
+旧 conv 下首次差异反而提前到索引 43。
+参考状态注入不进入独立 runner。
+
+另外筛选过上游 decode fused conv 的 BF16 乘法与
+FP32 逐 tap 累积顺序。相同输入/状态/权重的第 0 层
+输出可与上游 conv **逐位相等**，但改动后的
+140-token teacher/free **仍在索引 128 分歧**；
+前 128 项 selected-token logprob 平均绝对误差
+反而从 **0.024535 增到 0.032416**（最大误差
+0.274001→0.254238）。与上游状态注入组合虽在
+索引 128 选回 1061，却已在 **索引 43** 出现
+新的差异，因此不能当作正确修复。候选已撤回，
+正式 runner 算子不变；不使用硬编码 token 修正。
+
+远端诊断 artifact：`qwen38-reference-140-top10{,-eager}.json`、
+`qwen38-129-dense-{teacher,free}-140.json`、
+`qwen38-ref-layer-138-batch3/`、
+`qwen38-lite-layer-138/`、
+`qwen38-ref-prefill-state-11/`、
+`qwen38-ref-prefill-injected-teacher140.json`、
+`qwen38-direct-conv-{teacher,free}-140.json`、
+`qwen38-direct-conv-ref-prefill-teacher140.json`。
+下一步需重现批量 prefill 的投影、卷积和 GDN state
+更新数值顺序，再分别对照 decode 与其他层；不能以
+140-token 单项表面通过代替全模型数值验收。
+
+### 批量 prefill 续查（仍未修复）
+
+第 0 层所有 11 个 prompt token 的 embedding 与参考
+逐位一致；原先逐 token 路径的 HC mix 和 BF16 QKVZ
+投影与参考批量路径不同。在相同输入上批量编译 HC mix
+和批量 `F.linear` QKVZ 可分别逐位复现参考，grouped
+norm 本身也逐位一致。只改第 0 层 HC mix 的隔离
+140-token teacher 首次差异提前到索引 43。
+
+独立核实验中，使用 BF16 产品、按 tap 顺序 FP32 累积
+并再做 SiLU 的 **11-token prefill** convolution，
+其逐 token Q/K/V 和最终 conv history 均与参考逐位相等；
+FP32 产品则每 token 差 298–412 项。参考使用的 FLA
+chunk 内核对捕获的相同 Q/K/V/g/beta 逐位复现
+11-token 输出，并把**传入的 state buffer** 原地更新成
+与参考逐位相同的终态。注意该 API 额外返回的 `h`
+并非原地 state buffer，不能将二者混为一谈。
+直接尝试 FlashInfer SM120 chunk 在这些真实输入上
+产出 NaN，不能作替代。十个 FLA 依赖模块曾在远端
+`results/owned_fla/` 中去除 SGLang runtime import，
+隔离复现了输出和原地终态；尚未并入 runner。
+
+完整 11-token 批量 prompt 路径还需保持 expert batch
+维度：单 token MoE 调用的初版原型首次分歧索引 2，
+批量 FP4 expert 改善到 49；加入独立 chunk、
+准确 prefill conv 后，原型第 1 层末端 hidden RMS
+从 **0.001309 降至 0.000254**，第 47 层从
+**0.5357 降至 0.1169**，但首次输出差异仍在索引
+**125**，第 129 个输出依旧选 271 而非参考 1061。
+单层 stage 对照发现第 0 层 attention all-reduce 后的
+RMS 为 0.000434，HC combine 后为 0.000032；
+向 MoE HC mix 临时注入准确参考 hidden 可使混合输出
+逐位相同，证明 mix 本身不是这部分残差的来源。
+
+在相同 MoE 输入和逐位一致的 router 权重上，批量
+`F.linear` 的 11×512 BF16 router logits 与参考有
+**583/5632** 项差异（RMS 0.01125），逐 token
+GEMV 则仅差 **4/5632** 项。参考的 fused top-k
+在 logits 并列时按 expert ID 升序选取，Torch
+`topk` 与之有 4 项 ID 顺序差异；
+`torch.argsort(descending=True, stable=True)` 在捕获的
+参考 logits 上完全匹配 ID，归一化权重最大差约
+`2.98e-8`。但改用逐 token router GEMV 和稳定排序的
+**完整**批量原型首次输出差异仍提前至索引 **43**
+（137/140 top-1 相同），第 129 个输出仍错误。
+该原型第 47 层 prompt hidden RMS 约 **0.10686**；
+误差从第 35 层的 0.01299 到第 36 层的 0.02471
+被放大。用有 layer-ID 条件的参考 hook 正确捕获第 36
+层混合输入，再仅向该层 GDN 注入该**相同输入**，
+rank0 局部 attention 输出 RMS 从 **0.01091**
+降至 **0.000227**，说明该层主要放大上游输入漂移，
+而非已证实 chunk 叶子本身在该层严重失配。
+这仍只是一次 prompt/一个 rank 的隔离诊断。
+这些局部对齐不能替代完整轨迹回归，均未并入 runner。
+也未对失败原型运行 2100-token 验收或宣称速度提升。
+
+远端隔离脚本/记录包括
+`qwen38-batched-prefill-{moe,fla,fla-route}.py` 及 `.json`、
+`qwen38-ref-prefill-stage0-{combine,moe,router,router-weight}/`、
+`qwen38-batched-prefill-fla-{stage0-combine,inject0-router-weight}/`
+、`qwen38-ref-prefill-stage36-input-fixed/` 和
+`results/owned_fla/`。下一步应在同一批量 MoE 输入
+上继续核对各 rank 的共享专家与路由专家，再逐层对照
+QSA/PLE 和 decode 状态；在 140 与 2100 teacher/free
+均不退化之前，不接纳批量 prefill 修改。
+
+### QSA 门控与批量投影续查（仍未修复）
+
+在参考引擎捕获的第 3 层、11-token prefill 的**同一份**
+attention 输出、QKV 投影和相同 `o_proj` 权重上：
+旧版先在 BF16 中求 sigmoid 并相乘，再做投影，只有
+**12,311/28,160** 项输出与参考逐位相同；先在 FP32
+求 sigmoid 和相乘、最后一次舍入 BF16，则
+**28,160/28,160** 项相同。隔离 Triton 单核也达到相同
+的逐位结果，GPU 叶子回归 **25 项通过**。但只把该核用于
+正式逐 token runner 后，140-token graph teacher forcing
+从索引 **19** 首次偏离参考（**137/140**），索引 128
+仍选 271 而非 1061；加入前的首次分歧是索引 128。
+同一核用于此前最佳的批量 prefill 隔离原型后，仅
+**138/140**，错在索引 43 和 120；未将核或单测并入仓库。
+
+在另一份相同参考 QSA 输入上，lite 的 QKV 分片权重与
+参考逐位相同；一次 11-token BF16 批量投影的
+**22,528/22,528** 项 QKV 与参考逐位相同，逐 token
+投影则有 **17 项**差异。只在最佳批量 prefill 原型中
+替换这项 QKV 投影后，140-token teacher 仍是
+**139/140**，唯一错误从索引 90 移到 **43**，索引
+128 虽正确但并非完整修复。这两个叶子差异不能直接
+叠加成正确模型，更不能据此声称有提速。单 prompt、
+其他层/各 rank、2100-token 和服务端均未验收；
+正式 runner 仍为 `a63545b` 的计算路径。
+
+本轮未覆盖既有远端诊断脚本或本地未提交测试。
+新远端隔离目录为 `results/qwen38-gate-20261005/`，
+包含门控叶子、140-token graph teacher 和两个批量
+prefill 对照；结束时八卡各约 2 MiB。后续应以**相同
+输入**逐项核对共享专家、路由专家和 QSA/PLE 的前向及
+状态，并以完整 teacher/free 轨迹作为接纳门槛。

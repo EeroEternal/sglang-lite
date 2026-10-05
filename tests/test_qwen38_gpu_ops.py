@@ -44,6 +44,29 @@ class QwenGpuOpsTests(unittest.TestCase):
             expected = (scores.softmax(-1) @ values).to(q.dtype)
             torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
 
+    def test_attention_crosses_sparse_budget_with_selected_slots(self):
+        q = torch.randn((3, 256), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((2112, 256), device="cuda", dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        # Before the budget, the selected tensor must be ignored. At the
+        # boundary it must replace dense slots, including the pending block.
+        selected = torch.cat(
+            (
+                torch.arange(2047, -1, -1, device="cuda", dtype=torch.int32),
+                torch.arange(2048, 2052, device="cuda", dtype=torch.int32),
+            )
+        )
+        for position in (2047, 2048, 2050):
+            actual = self.ops.attention(q, k, v, torch.tensor([position], device="cuda"), selected)
+            wanted = (
+                torch.arange(position + 1, device="cuda")
+                if position < 2048
+                else selected[(selected >= 0) & (selected <= position)].long()
+            )
+            scores = q.float() @ k[wanted].float().T / 16
+            expected = (scores.softmax(-1) @ v[wanted].float()).to(q.dtype)
+            torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
+
     def test_gdn_recurrence_state_and_output(self):
         q = torch.randn((2, 128), device="cuda", dtype=torch.bfloat16)
         k = torch.randn_like(q)
